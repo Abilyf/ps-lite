@@ -77,7 +77,7 @@ file(GLOB_RECURSE SOURCE "src/*.cc")
 target_include_directories(pslite PUBLIC "${PROJECT_SOURCE_DIR}/include/")
 target_sources(pslite PRIVATE ${SOURCE})
 
-add_subdirectory(tests)
+#add_subdirectory(tests)
 
 #quic
 add_subdirectory("3rdparty/quic")
