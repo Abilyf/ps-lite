@@ -1,0 +1,24 @@
+﻿{
+  "configurations": [
+    {
+      "name": "Linux-GCC-Release",
+      "generator": "Unix Makefiles",
+      "configurationType": "Release",
+      "cmakeExecutable": "/usr/local/bin/cmake",
+      "remoteCopySourcesExclusionList": [ ".vs", ".git", "out" ],
+      "cmakeCommandArgs": "",
+      "buildCommandArgs": "",
+      "ctestCommandArgs": "",
+      "inheritEnvironments": [ "linux_x64" ],
+      "remoteMachineName": "810978562;10.223.228.78 (username=abilyf, port=22, authentication=Password)",
+      "remoteCMakeListsRoot": "$HOME/Code/vsProject/${projectDirName}",
+      "remoteBuildRoot": "$HOME/Code/vsProject/${projectDirName}",
+      "remoteInstallRoot": "$HOME/Code/vsProject/${projectDirName}",
+      "remoteCopySources": true,
+      "rsyncCommandArgs": "-avz  --delete",
+      "remoteCopyBuildOutput": true,
+      "remoteCopySourcesMethod": "rsync",
+      "intelliSenseMode": "linux-gcc-x64"
+    }
+  ]
+}

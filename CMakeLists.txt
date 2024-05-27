@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)
 
 add_library(pslite)
+target_link_libraries(pslite PUBLIC -lpthread)
 
 if(POLICY CMP0074)  # Support Protobuf_ROOT etc environment variables on CMake 3.12+
   cmake_policy(SET CMP0074 NEW)
@@ -77,3 +78,13 @@ target_include_directories(pslite PUBLIC "${PROJECT_SOURCE_DIR}/include/")
 target_sources(pslite PRIVATE ${SOURCE})
 
 add_subdirectory(tests)
+
+#quic
+add_subdirectory("3rdparty/quic")
+target_include_directories(pslite PUBLIC 
+"${PROJECT_SOURCE_DIR}/3rdparty/quic/picoquic" 
+"${PROJECT_SOURCE_DIR}/3rdparty/quic/picoquictest" 
+"${PROJECT_SOURCE_DIR}/3rdparty/quic/picohttp"
+"../picotls/include"
+${PICOTLS_INCLUDE_DIR})
+target_link_libraries(pslite PUBLIC picohttp-core picoquic-core)

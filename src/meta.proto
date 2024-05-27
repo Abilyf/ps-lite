@@ -39,8 +39,12 @@ message PBMeta {
   // true: a request task
   // false: the response task to the request task with the same *time*
   optional bool request = 4 [default = false];
+  // false: no data; true: has data
+  optional int32 more = 15;
   // the unique id of an application
   optional int32 app_id = 7;
+  // the sender of this msg
+  optional int32 sender = 14;
   // the timestamp of this message
   optional int32 timestamp = 8;
   // data type of message.data[i]

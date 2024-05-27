@@ -1,0 +1,2916 @@
+/*
+* Author: Christian Huitema
+* Copyright (c) 2017, Private Octopus, Inc.
+* All rights reserved.
+*
+* Permission to use, copy, modify, and distribute this software for any
+* purpose with or without fee is hereby granted, provided that the above
+* copyright notice and this permission notice appear in all copies.
+*
+* THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+* ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+* DISCLAIMED. IN NO EVENT SHALL Private Octopus, Inc. BE LIABLE FOR ANY
+* DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+* (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+* LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+* ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+* SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+
+#include "picoquic_internal.h"
+#include "picosocks.h"
+#include "tls_api.h"
+#include <stdlib.h>
+#include <string.h>
+#include "plugin.h"
+#include "memory.h"
+#include <ifaddrs.h>
+#include <net/if.h>
+#ifndef _WINDOWS
+#include <sys/time.h>
+#include <netinet/in.h>
+
+#include <dirent.h>
+#include <stdio.h>
+#endif
+
+
+/*
+* Structures used in the hash table of connections
+*/
+typedef struct st_picoquic_cnx_id_t {
+    picoquic_connection_id_t cnx_id;
+    picoquic_cnx_t* cnx;
+    struct st_picoquic_cnx_id_t* next_cnx_id;
+} picoquic_cnx_id;
+
+typedef struct st_picoquic_net_id_t {
+    struct sockaddr_storage saddr;
+    picoquic_cnx_t* cnx;
+    struct st_picoquic_net_id_t* next_net_id;
+} picoquic_net_id;
+
+/* Hash and compare for CNX hash tables */
+static uint64_t picoquic_cnx_id_hash(void* key)
+{
+    picoquic_cnx_id* cid = (picoquic_cnx_id*)key;
+
+    /* TODO: should scramble the value for security and DOS protection */
+    return picoquic_val64_connection_id(cid->cnx_id);
+}
+
+static int picoquic_cnx_id_compare(void* key1, void* key2)
+{
+    picoquic_cnx_id* cid1 = (picoquic_cnx_id*)key1;
+    picoquic_cnx_id* cid2 = (picoquic_cnx_id*)key2;
+
+    return picoquic_compare_connection_id(&cid1->cnx_id, &cid2->cnx_id);
+}
+
+static uint64_t picoquic_net_id_hash(void* key)
+{
+    picoquic_net_id* net = (picoquic_net_id*)key;
+
+    return picohash_bytes((uint8_t*)&net->saddr, sizeof(net->saddr));
+}
+
+static int picoquic_net_id_compare(void* key1, void* key2)
+{
+    picoquic_net_id* net1 = (picoquic_net_id*)key1;
+    picoquic_net_id* net2 = (picoquic_net_id*)key2;
+
+    return memcmp(&net1->saddr, &net2->saddr, sizeof(net1->saddr));
+}
+
+#if 0
+/* Not used yet, should be used in ordering connections by wake time. */
+static int picoquic_compare_cnx_waketime(void * v_cnxleft, void * v_cnxright) {
+    /* Example:  return *((int*)l) - *((int*)r); */
+    int ret = 0;
+    if (v_cnxleft != v_cnxright) {
+        picoquic_cnx_t * cnx_l = (picoquic_cnx_t *)v_cnxleft;
+        picoquic_cnx_t * cnx_r = (picoquic_cnx_t *)v_cnxright;
+
+        if (cnx_l->next_wake_time > cnx_r->next_wake_time) {
+            ret = 1;
+        }
+        else if (cnx_l->next_wake_time < cnx_r->next_wake_time) {
+            ret = -1;
+        }
+        else {
+            if (((intptr_t)v_cnxleft) > ((intptr_t)v_cnxright)) {
+                ret = 1;
+            }
+            else {
+                ret = -1;
+            }
+        }
+    }
+    return ret;
+}
+#endif
+
+picoquic_packet_context_enum picoquic_context_from_epoch(int epoch)
+{
+    static picoquic_packet_context_enum const pc[4] = {
+        picoquic_packet_context_initial,
+        picoquic_packet_context_application,
+        picoquic_packet_context_handshake,
+        picoquic_packet_context_application
+    };
+
+    return (epoch >= 0 && epoch < 5) ? pc[epoch] : 0;
+}
+
+/*
+ * Supported versions. Specific versions may mandate different processing of different
+ * formats.
+ * The first version in the list is the preferred version.
+ * The protection of clear text packets will be a function of the version negotiation.
+ */
+
+static uint8_t picoquic_cleartext_internal_test_1_salt[] = {
+    0x30, 0x67, 0x16, 0xd7, 0x63, 0x75, 0xd5, 0x55,
+    0x4b, 0x2f, 0x60, 0x5e, 0xef, 0x78, 0xd8, 0x33,
+    0x3d, 0xc1, 0xca, 0x36
+};
+
+static uint8_t picoquic_cleartext_draft_29_salt[] = {
+    0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c,
+    0x9e, 0x97, 0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0,
+    0x43, 0x90, 0xa8, 0x99
+};
+
+const picoquic_version_parameters_t picoquic_supported_versions[] = {
+    { PICOQUIC_INTERNAL_TEST_VERSION_1, 0,
+        picoquic_version_header_29,
+        sizeof(picoquic_cleartext_internal_test_1_salt),
+        picoquic_cleartext_internal_test_1_salt },
+    { PICOQUIC_INTEROP_VERSION, 0,
+        picoquic_version_header_29,
+        sizeof(picoquic_cleartext_draft_29_salt),
+            picoquic_cleartext_draft_29_salt }
+};
+
+const size_t picoquic_nb_supported_versions = sizeof(picoquic_supported_versions) / sizeof(picoquic_version_parameters_t);
+
+
+int picoquic_get_plugin_stats(picoquic_cnx_t *cnx, plugin_stat_t **statsptr, int nmemb) {
+
+    protocol_operation_struct_t *ops = (cnx->ops);
+    protocol_operation_struct_t *current_post, *tmp_protoop;
+    protocol_operation_param_struct_t *current_popst, *tmp_popst;
+    observer_node_t *cur;
+    plugin_stat_t *stats = *statsptr;
+    if (!stats || nmemb == 0) {
+        nmemb = 100;
+        stats = malloc(nmemb*sizeof(plugin_stat_t));
+        if (!stats) return -1;
+    }
+
+    int current_position = 0;
+
+
+
+    HASH_ITER(hh, ops, current_post, tmp_protoop) {
+        if (current_position == nmemb) {
+            nmemb *= 2;
+            stats = realloc(stats, nmemb*sizeof(plugin_stat_t));
+            if (!stats) return -1;
+        }
+
+        if (current_post->is_parametrable) {
+            HASH_ITER(hh, current_post->params, current_popst, tmp_popst) {
+                if (current_popst->replace) {
+                    stats[current_position].protoop_name = current_post->name;
+                    stats[current_position].pluglet_name = current_popst->replace->p->name;
+                    stats[current_position].replace = true;
+                    stats[current_position].pre = false;
+                    stats[current_position].post = false;
+                    stats[current_position].is_param = true;
+                    stats[current_position].param = current_popst->param;
+                    stats[current_position].count = current_popst->replace->count;
+                    stats[current_position].total_execution_time = current_popst->replace->total_execution_time;
+                    current_position++;
+                }
+
+                if (current_popst->pre) {
+                    cur = current_popst->pre;
+                    while (cur) {
+                        if (current_position == nmemb) {
+                            nmemb *= 2;
+                            stats = realloc(stats, nmemb*sizeof(plugin_stat_t));
+                            if (!stats) return -1;
+                        }
+                        stats[current_position].protoop_name = current_post->name;
+                        stats[current_position].pluglet_name = cur->observer->p->name;
+                        stats[current_position].replace = false;
+                        stats[current_position].pre = true;
+                        stats[current_position].post = false;
+                        stats[current_position].is_param = true;
+                        stats[current_position].param = current_popst->param;
+                        stats[current_position].count = cur->observer->count;
+                        stats[current_position].total_execution_time = cur->observer->total_execution_time;
+                        cur = cur->next;
+                        current_position++;
+                    }
+                }
+                if (current_popst->post) {
+                    cur = current_popst->post;
+                    while (cur) {
+                        if (current_position == nmemb) {
+                            nmemb *= 2;
+                            stats = realloc(stats, nmemb*sizeof(plugin_stat_t));
+                            if (!stats) return -1;
+                        }
+                        stats[current_position].protoop_name = current_post->name;
+                        stats[current_position].pluglet_name = cur->observer->p->name;
+                        stats[current_position].replace = false;
+                        stats[current_position].pre = false;
+                        stats[current_position].post = true;
+                        stats[current_position].is_param = true;
+                        stats[current_position].param = current_popst->param;
+                        stats[current_position].count = cur->observer->count;
+                        stats[current_position].total_execution_time = cur->observer->total_execution_time;
+                        cur = cur->next;
+                        current_position++;
+                    }
+                }
+            }
+        } else {
+            current_popst = current_post->params;
+            if (current_popst->replace) {
+                if (current_position == nmemb) {
+                    nmemb *= 2;
+                    stats = realloc(stats, nmemb*sizeof(plugin_stat_t));
+                    if (!stats) return -1;
+                }
+                stats[current_position].protoop_name = current_post->name;
+                stats[current_position].pluglet_name = current_popst->replace->p->name;
+                stats[current_position].replace = true;
+                stats[current_position].pre = false;
+                stats[current_position].post = false;
+                stats[current_position].is_param = false;
+                stats[current_position].count = current_popst->replace->count;
+                stats[current_position].total_execution_time = current_popst->replace->total_execution_time;
+                current_position++;
+            }
+
+            if (current_popst->pre) {
+                cur = current_popst->pre;
+                while (cur) {
+                    if (current_position == nmemb) {
+                        nmemb *= 2;
+                        stats = realloc(stats, nmemb*sizeof(plugin_stat_t));
+                        if (!stats) return -1;
+                    }
+                    stats[current_position].protoop_name = current_post->name;
+                    stats[current_position].pluglet_name = cur->observer->p->name;
+                    stats[current_position].replace = false;
+                    stats[current_position].pre = true;
+                    stats[current_position].post = false;
+                    stats[current_position].is_param = false;
+                    stats[current_position].count = cur->observer->count;
+                    stats[current_position].total_execution_time = cur->observer->total_execution_time;
+                    cur = cur->next;
+                    current_position++;
+                }
+            }
+            if (current_popst->post) {
+                cur = current_popst->post;
+                while (cur) {
+                    if (current_position == nmemb) {
+                        nmemb *= 2;
+                        stats = realloc(stats, nmemb*sizeof(plugin_stat_t));
+                        if (!stats) return -1;
+                    }
+                    stats[current_position].protoop_name = current_post->name;
+                    stats[current_position].pluglet_name = cur->observer->p->name;
+                    stats[current_position].replace = false;
+                    stats[current_position].pre = false;
+                    stats[current_position].post = true;
+                    stats[current_position].is_param = false;
+                    stats[current_position].count = cur->observer->count;
+                    stats[current_position].total_execution_time = cur->observer->total_execution_time;
+                    cur = cur->next;
+                    current_position++;
+                }
+            }
+        }
+    }
+    *statsptr = stats;
+    return current_position;
+}
+
+void picoquic_free_protoops(protocol_operation_struct_t * ops)
+{
+    protocol_operation_struct_t *current_post, *tmp_protoop;
+    protocol_operation_param_struct_t *current_popst, *tmp_popst;
+    observer_node_t *cur_del, *tmp;
+
+    HASH_ITER(hh, ops, current_post, tmp_protoop) {
+        HASH_DEL(ops, current_post);
+
+        if (current_post->is_parametrable) {
+            HASH_ITER(hh, current_post->params, current_popst, tmp_popst) {
+                HASH_DEL(current_post->params, current_popst);
+                if (current_popst->replace) {
+                    release_elf(current_popst->replace);
+                }
+
+                if (current_popst->pre) {
+                    cur_del = current_popst->pre;
+                    while (cur_del) {
+                        tmp = cur_del->next;
+                        release_elf(cur_del->observer);
+                        free(cur_del);
+                        cur_del = tmp;
+                    }
+                }
+                if (current_popst->post) {
+                    cur_del = current_popst->post;
+                    while (cur_del) {
+                        tmp = cur_del->next;
+                        release_elf(cur_del->observer);
+                        free(cur_del);
+                        cur_del = tmp;
+                    }
+                }
+                free(current_popst);
+            }
+        } else {
+            current_popst = current_post->params;
+            if (current_popst->replace) {
+                release_elf(current_popst->replace);
+            }
+
+            if (current_popst->pre) {
+                cur_del = current_popst->pre;
+                while (cur_del) {
+                    tmp = cur_del->next;
+                    release_elf(cur_del->observer);
+                    free(cur_del);
+                    cur_del = tmp;
+                }
+            }
+            if (current_popst->post) {
+                cur_del = current_popst->post;
+                while (cur_del) {
+                    tmp = cur_del->next;
+                    release_elf(cur_del->observer);
+                    free(cur_del);
+                    cur_del = tmp;
+                }
+            }
+            free(current_popst);
+        }
+
+        free(current_post->pid.id);
+        free(current_post);
+    }
+}
+
+void picoquic_free_plugins(protoop_plugin_t *plugins)
+{
+    protoop_plugin_t *current_p, *tmp_p;
+    HASH_ITER(hh, plugins, current_p, tmp_p) {
+        HASH_DEL(plugins, current_p);
+        /* This remains safe to do this, as the memory of the frame context will be freed when cnx will */
+        queue_free(current_p->block_queue_cc);
+        queue_free(current_p->block_queue_non_cc);
+        destroy_memory_management(current_p);
+        free(current_p->path);
+        free(current_p);
+    }
+}
+
+void picoquic_free_protoops_and_plugins(picoquic_cnx_t* cnx)
+{
+    picoquic_free_protoops(cnx->ops);
+    picoquic_free_plugins(cnx->plugins);
+}
+
+void picoquic_free_cached_plugins(cached_plugins_t* cplugins)
+{
+    picoquic_free_protoops(cplugins->ops);
+    picoquic_free_plugins(cplugins->plugins);
+    free(cplugins);
+}
+
+int picoquic_get_supported_plugins(picoquic_quic_t* quic)
+{
+    quic->supported_plugins.size = 0;
+    quic->supported_plugins.name_num_bytes = 0;
+
+    if (quic->plugin_store_path == NULL) {
+        /* No store path, so no supported plugins */
+        return 0;
+    }
+
+#ifdef _WINDOWS
+    DBG_PRINTF("File listing in Windows is not supported yet.\n");
+    return 0;
+#endif
+
+    /* Single pass */
+    DIR *d, *sub_d;
+    struct dirent *dir, *sub_dir;
+    const int max_plugin_fname_len = strlen(quic->plugin_store_path) + 514; /* From d_name max length, plus the separator and null char*/
+    char tmp_buf[max_plugin_fname_len];
+    char pid_buf[250]; /* Required plugin name size */
+    bool require_negotiation;
+    size_t pid_size, path_size;
+    d = opendir(quic->plugin_store_path);
+    if (d) {
+        while ((dir = readdir(d)) != NULL) {
+            /* The first character cannot be a '.' */
+            if (dir->d_name[0] != '.') {
+                /* Don't forget to reinit tmp_buf... */
+                memset(tmp_buf, 0, max_plugin_fname_len);
+                strcpy(tmp_buf, quic->plugin_store_path);
+                picoquic_string_join_path_and_fname(tmp_buf, dir->d_name);
+                sub_d = opendir(tmp_buf);
+                if (sub_d) {
+                    while ((sub_dir = readdir(sub_d)) != NULL) {
+                        if (picoquic_string_ends_with(sub_dir->d_name, ".plugin")) {
+                            picoquic_string_join_path_and_fname(tmp_buf, sub_dir->d_name);
+                            if (plugin_parse_plugin_id(tmp_buf, pid_buf, &require_negotiation)) {
+                                fprintf(stderr, "Error when parsing PID of path %s\n", tmp_buf);
+                                continue;
+                            } else if (require_negotiation) {
+                                printf("Plugin %s requires negotiation, so don't advertise it in supported plugins...\n", pid_buf);
+                                continue;
+                            }
+                            pid_size = strlen(pid_buf);
+                            path_size = strlen(tmp_buf);
+                            quic->supported_plugins.elems[quic->supported_plugins.size].plugin_path = malloc(sizeof(char) * (path_size + 1));
+                            if (quic->supported_plugins.elems[quic->supported_plugins.size].plugin_path == NULL) {
+                                fprintf(stderr, "Error when malloc'ing memory for path %s\n", tmp_buf);
+                                continue;
+                            }
+                            quic->supported_plugins.elems[quic->supported_plugins.size].plugin_name = malloc(sizeof(char) * (pid_size + 1));
+                            if (quic->supported_plugins.elems[quic->supported_plugins.size].plugin_name == NULL) {
+                                fprintf(stderr, "Error when malloc'ing memory for name %s\n", pid_buf);
+                                free(quic->supported_plugins.elems[quic->supported_plugins.size].plugin_path);
+                                continue;
+                            }
+                            strcpy(quic->supported_plugins.elems[quic->supported_plugins.size].plugin_path, tmp_buf);
+                            strcpy(quic->supported_plugins.elems[quic->supported_plugins.size].plugin_name, pid_buf);
+                            quic->supported_plugins.name_num_bytes += pid_size;
+                            quic->supported_plugins.size++;
+
+                            if (quic->supported_plugins.size >= MAX_PLUGIN) {
+                                fprintf(stderr, "WARNING: limit of supported plugins reached!\n");
+                                break;
+                            }
+                        }
+                    }
+                    closedir(sub_d);
+                }
+            }
+        }
+        closedir(d);
+    }
+
+    return 0;
+}
+
+static int inject_plugin(plugin_list_t *quic_plugins, const char** plugin_fnames, int plugins) {
+    int err = 0;
+    char buf[256];
+    size_t buf_len;
+    int i;
+    bool require_negotiation;
+    for (i = 0; err == 0 && i < plugins; i++) {
+        err = plugin_parse_plugin_id(plugin_fnames[i], buf, &require_negotiation);
+        if (err != 0) {
+            break;
+        }
+        buf_len = strlen(buf);
+        quic_plugins->elems[i].plugin_name = malloc(sizeof(char) * (buf_len + 1));
+        if (quic_plugins->elems[i].plugin_name == NULL) {
+            break;
+        }
+        quic_plugins->elems[i].plugin_path = malloc(sizeof(char) * (strlen(plugin_fnames[i]) + 1));
+        if (quic_plugins->elems[i].plugin_path == NULL) {
+            free(quic_plugins->elems[i].plugin_name);
+            break;
+        }
+        strcpy(quic_plugins->elems[i].plugin_name, buf);
+        strcpy(quic_plugins->elems[i].plugin_path, plugin_fnames[i]);
+        quic_plugins->elems[i].require_negotiation = require_negotiation;
+        quic_plugins->name_num_bytes += buf_len;
+        quic_plugins->size++;
+    }
+
+    if (err != 0) {
+        /* Free everything! */
+        for (int j = 0; j < i; j++) {
+            free(quic_plugins->elems[i].plugin_name);
+            free(quic_plugins->elems[i].plugin_path);
+        }
+        quic_plugins->size = 0;
+        quic_plugins->name_num_bytes = 0;
+        return 1;
+    }
+
+    return 0;
+}
+
+
+int picoquic_set_plugins_to_inject(picoquic_quic_t* quic, const char** plugin_fnames, int plugins)
+{
+    return inject_plugin(&quic->plugins_to_inject, plugin_fnames, plugins);
+}
+
+int picoquic_set_local_plugins(picoquic_quic_t* quic, const char** plugin_fnames, int plugins)
+{
+    return inject_plugin(&quic->local_plugins, plugin_fnames, plugins);
+}
+
+int picoquic_set_log(picoquic_quic_t* quic, const char *log_fname)
+{
+    FILE* F_log = NULL;
+
+    if (log_fname != NULL && strcmp(log_fname, "/dev/null") != 0) {
+#ifdef _WINDOWS
+        if (fopen_s(&F_log, log_file, "w") != 0) {
+                F_log = NULL;
+            }
+#else
+        F_log = fopen(log_fname, "w");
+#endif
+        if (F_log == NULL) {
+            fprintf(stderr, "Could not open the log file <%s>\n", log_fname);
+            return 1;
+        }
+    }
+
+    if (!F_log && (!log_fname || strcmp(log_fname, "/dev/null") != 0)) {
+        F_log = stdout;
+    }
+
+    PICOQUIC_SET_LOG(quic, F_log);
+
+    return 0;
+}
+
+/* QUIC context create and dispose */
+picoquic_quic_t* picoquic_create(uint32_t nb_connections,
+    char const* cert_file_name,
+    char const* key_file_name,
+    char const * cert_root_file_name,
+    char const* default_alpn, //alpn应用层协议协商，一个tls的扩展
+    picoquic_stream_data_cb_fn default_callback_fn,//这里也是创建一个回调函数的函数指针
+    void* default_callback_ctx,//关于www_dir的上下文结构体
+    cnx_id_cb_fn cnx_id_callback, //创建了一个函数指针，用于回调函数
+    void* cnx_id_callback_ctx,
+    uint8_t reset_seed[PICOQUIC_RESET_SECRET_SIZE],
+    uint64_t current_time,
+    uint64_t* p_simulated_time,//没用到
+    char const* ticket_file_name,//没用到
+    const uint8_t* ticket_encryption_key,//没用到
+    size_t ticket_encryption_key_length,//没用到
+    const char* plugin_store_path)//没用到
+{
+    picoquic_quic_t* quic = (picoquic_quic_t*)malloc(sizeof(picoquic_quic_t)); //动态分配内存空间
+    int ret = 0;//定义返回值
+
+    if (quic == NULL) { //这里出现NULL的可能是上面malloc()函数分配内存不成功的情况，一般发生这种情况是出现了内存泄露的错误
+        ret = -1;
+    } else {
+        /* TODO: winsock init */
+        /* TODO: open UDP sockets - maybe */
+        memset(quic, 0, sizeof(picoquic_quic_t)); //对申请到的内存块进行初始化操作（置零）否则会出现随机数
+
+        /*对对应值进行赋值操作*/
+        quic->default_callback_fn = default_callback_fn;
+        quic->default_callback_ctx = default_callback_ctx;
+        quic->default_congestion_alg = PICOQUIC_DEFAULT_CONGESTION_ALGORITHM;
+        quic->default_alpn = picoquic_string_duplicate(default_alpn);
+        quic->cnx_id_callback_fn = cnx_id_callback;
+        quic->cnx_id_callback_ctx = cnx_id_callback_ctx;
+        quic->p_simulated_time = p_simulated_time;
+        quic->local_ctx_length = 8; /* TODO: should be lower on clients-only implementation */
+
+        if (cnx_id_callback != NULL) {
+            //flags为0，由memsetz()知
+            quic->flags |= picoquic_context_unconditional_cnx_id;//a|=b->a=a|b（或）
+        }
+
+        if (ticket_file_name != NULL) {
+            quic->ticket_file_name = ticket_file_name;
+            ret = picoquic_load_tickets(&quic->p_first_ticket, current_time, ticket_file_name);
+
+            if (ret == PICOQUIC_ERROR_NO_SUCH_FILE) {
+                DBG_PRINTF("Ticket file <%s> not created yet.\n", ticket_file_name);
+                ret = 0;
+            } else if (ret != 0) {
+                DBG_PRINTF("Cannot load tickets from <%s>\n", ticket_file_name);
+            }
+        }
+    }
+
+    if (ret == 0) {
+        quic->table_cnx_by_id = picohash_create(nb_connections * 4,
+            picoquic_cnx_id_hash, picoquic_cnx_id_compare);
+
+        quic->table_cnx_by_net = picohash_create(nb_connections * 4,
+            picoquic_net_id_hash, picoquic_net_id_compare);
+
+        if (quic->table_cnx_by_id == NULL || quic->table_cnx_by_net == NULL) {
+            ret = -1;
+            DBG_PRINTF("%s", "Cannot initialize hash tables\n");
+        }
+        else if (picoquic_master_tlscontext(quic, cert_file_name, key_file_name, cert_root_file_name, ticket_encryption_key, ticket_encryption_key_length) != 0) {
+                ret = -1;
+                DBG_PRINTF("%s", "Cannot create TLS context \n");
+        } else {
+            /* the random generator was initialized as part of the TLS context.
+             * Use it to create the seed for generating the per context stateless
+             * resets. */
+
+            if (!reset_seed)
+                picoquic_crypto_random(quic, quic->reset_seed, sizeof(quic->reset_seed));
+            else
+                memcpy(quic->reset_seed, reset_seed, sizeof(quic->reset_seed));
+
+            quic->cached_plugins_queue = queue_init();
+            if (!quic->cached_plugins_queue) {
+                ret = -1;
+                DBG_PRINTF("%s", "Cannot create cached plugins queue \n");
+            }
+            quic->plugin_store_path = NULL;
+            if (plugin_store_path != NULL) {
+                if (picoquic_check_or_create_directory(plugin_store_path)) {
+                    fprintf(stderr, "Cannot use plugin cache %s; continue without it.\n", plugin_store_path);
+                } else {
+                    quic->plugin_store_path = malloc(sizeof(char) * (strlen(plugin_store_path) + 1));
+                    strcpy(quic->plugin_store_path, plugin_store_path);
+                }
+            }
+            picoquic_get_supported_plugins(quic);
+            /* If plugins should be inserted, a dedicated call will occur */
+            quic->plugins_to_inject.size = 0;
+            quic->plugins_to_inject.name_num_bytes = 0;
+            quic->local_plugins.size = 0;
+            quic->local_plugins.name_num_bytes = 0;
+        }
+    }
+
+    if (ret != 0 && quic != NULL) {
+        picoquic_free(quic);
+        quic = NULL;
+    }
+
+    return quic;
+}
+
+int picoquic_set_default_tp(picoquic_quic_t* quic, picoquic_tp_t * tp)
+{
+    int ret = 0;
+
+    if (quic->default_tp == NULL) {
+        quic->default_tp = (picoquic_tp_t *)malloc(sizeof(picoquic_tp_t));
+    }
+
+    if (quic->default_tp == NULL) {
+        ret = PICOQUIC_ERROR_MEMORY;
+    }
+    else {
+        memcpy(quic->default_tp, tp, sizeof(picoquic_tp_t));
+    }
+
+    return ret;
+}
+
+void picoquic_free(picoquic_quic_t* quic)
+{
+    if (quic != NULL) {
+        if (quic->aead_encrypt_ticket_ctx != NULL) {
+            picoquic_aead_free(quic->aead_encrypt_ticket_ctx);
+            quic->aead_encrypt_ticket_ctx = NULL;
+        }
+
+        if (quic->aead_decrypt_ticket_ctx != NULL) {
+            picoquic_aead_free(quic->aead_decrypt_ticket_ctx);
+            quic->aead_decrypt_ticket_ctx = NULL;
+        }
+
+        if (quic->default_alpn != NULL) {
+            free((void*)quic->default_alpn);
+            quic->default_alpn = NULL;
+        }
+
+        /* delete the stored tickets */
+        picoquic_free_tickets(&quic->p_first_ticket);
+
+        /* delete all pending packets */
+        while (quic->pending_stateless_packet != NULL) {
+            picoquic_stateless_packet_t* to_delete = quic->pending_stateless_packet;
+            quic->pending_stateless_packet = to_delete->next_packet;
+            free(to_delete);
+        }
+
+        /* delete all the connection contexts */
+        while (quic->cnx_list != NULL) {
+            picoquic_delete_cnx(quic->cnx_list);
+        }
+
+        if (quic->table_cnx_by_id != NULL) {
+            picohash_delete(quic->table_cnx_by_id, 1);
+        }
+
+        if (quic->table_cnx_by_net != NULL) {
+            picohash_delete(quic->table_cnx_by_net, 1);
+        }
+
+        if (quic->verify_certificate_ctx != NULL &&
+            quic->free_verify_certificate_callback_fn != NULL) {
+            (quic->free_verify_certificate_callback_fn)(quic->verify_certificate_ctx);
+            quic->verify_certificate_ctx = NULL;
+        }
+
+        if (quic->verify_certificate_callback_fn != NULL) {
+            picoquic_dispose_verify_certificate_callback(quic, 1);
+        }
+
+        if (quic->default_tp == NULL) {
+            free(quic->default_tp);
+            quic->default_tp = NULL;
+        }
+
+        /* Delete the picotls context */
+        if (quic->tls_master_ctx != NULL) {
+            picoquic_master_tlscontext_free(quic);
+
+            free(quic->tls_master_ctx);
+            quic->tls_master_ctx = NULL;
+        }
+
+        if (quic->cached_plugins_queue != NULL) {
+            cached_plugins_t* tmp;
+            while(queue_peek(quic->cached_plugins_queue) != NULL) {
+                tmp = queue_dequeue(quic->cached_plugins_queue);
+                picoquic_free_cached_plugins(tmp);
+            }
+            queue_free(quic->cached_plugins_queue);
+        }
+
+        if (quic->supported_plugins.size > 0) {
+            for (int i = 0; i < quic->supported_plugins.size; i++) {
+                free(quic->supported_plugins.elems[i].plugin_name);
+                free(quic->supported_plugins.elems[i].plugin_path);
+            }
+        }
+
+        if (quic->plugins_to_inject.size > 0) {
+            for (int i = 0; i < quic->plugins_to_inject.size; i++) {
+                free(quic->plugins_to_inject.elems[i].plugin_name);
+                free(quic->plugins_to_inject.elems[i].plugin_path);
+            }
+        }
+
+        if (quic->plugin_store_path != NULL) {
+            free(quic->plugin_store_path);
+        }
+
+        free(quic);
+    }
+}
+
+void picoquic_set_null_verifier(picoquic_quic_t* quic) {
+    picoquic_dispose_verify_certificate_callback(quic, 1);
+}
+
+void picoquic_set_cookie_mode(picoquic_quic_t* quic, int cookie_mode)
+{
+    if (cookie_mode) {
+        quic->flags |= picoquic_context_check_token;//这里相当于是将最后一位置1
+        picoquic_crypto_random(quic, quic->retry_seed, PICOQUIC_RETRY_SECRET_SIZE);
+    } else {
+        quic->flags &= ~picoquic_context_check_token;//这里相当于是将最后一位置0
+    }
+}
+
+picoquic_stateless_packet_t* picoquic_create_stateless_packet(picoquic_quic_t* quic)
+{
+#ifdef _WINDOWS
+    UNREFERENCED_PARAMETER(quic);
+#endif
+    return (picoquic_stateless_packet_t*)malloc(sizeof(picoquic_stateless_packet_t));
+}
+
+void picoquic_delete_stateless_packet(picoquic_stateless_packet_t* sp)
+{
+    free(sp);
+}
+
+void picoquic_queue_stateless_packet(picoquic_quic_t* quic, picoquic_stateless_packet_t* sp)
+{
+    picoquic_stateless_packet_t** pnext = &quic->pending_stateless_packet;
+
+    while ((*pnext) != NULL) {
+        pnext = &(*pnext)->next_packet;
+    }
+
+    *pnext = sp;
+    sp->next_packet = NULL;
+}
+
+picoquic_stateless_packet_t* picoquic_dequeue_stateless_packet(picoquic_quic_t* quic)
+{
+    picoquic_stateless_packet_t* sp = quic->pending_stateless_packet;//取出指向数据包的地址
+
+    if (sp != NULL) {//如果指向的数据包存在
+        quic->pending_stateless_packet = sp->next_packet;//更新下一个数据包地址
+        sp->next_packet = NULL;//释放当前数据包的next指针
+    }
+
+    return sp;
+}
+
+/* Connection context creation and registration */
+int picoquic_register_cnx_id(picoquic_quic_t* quic, picoquic_cnx_t* cnx, const picoquic_connection_id_t* cnx_id)
+{
+    int ret = 0;
+    picoquic_cnx_id* key = (picoquic_cnx_id*)malloc(sizeof(picoquic_cnx_id));
+
+    if (key == NULL) {
+        ret = -1;
+    } else {
+        picohash_item* item;
+        key->cnx_id = *cnx_id;
+        key->cnx = cnx;
+        key->next_cnx_id = NULL;
+
+        item = picohash_retrieve(quic->table_cnx_by_id, key);
+
+        if (item != NULL) {
+            ret = -1;
+        } else {
+            ret = picohash_insert(quic->table_cnx_by_id, key);//插入key值的item，详见函数注释
+
+            if (ret == 0) {
+                key->next_cnx_id = cnx->first_cnx_id;
+                cnx->first_cnx_id = key;
+            }
+        }
+    }
+
+    return ret;
+}
+
+int picoquic_register_cnx_id_for_cnx(picoquic_cnx_t* cnx, const picoquic_connection_id_t* cnx_id)
+{
+    return picoquic_register_cnx_id(cnx->quic, cnx, cnx_id);
+}
+
+static void picoquic_set_hash_key_by_address(picoquic_net_id * key, struct sockaddr* addr)
+{
+    memset(&key->saddr, 0, sizeof(struct sockaddr_storage));
+
+    if (addr->sa_family == AF_INET) {
+        struct sockaddr_in * key4 = (struct sockaddr_in *) &key->saddr;
+        struct sockaddr_in * s4 = (struct sockaddr_in *) addr;
+
+#ifdef _WINDOWS
+        key4->sin_addr.S_un.S_addr = s4->sin_addr.S_un.S_addr;
+#else
+        key4->sin_addr.s_addr = s4->sin_addr.s_addr;
+#endif
+        key4->sin_family = s4->sin_family;
+        key4->sin_port = s4->sin_port;
+    }
+    else {
+        struct sockaddr_in6 * key6 = (struct sockaddr_in6 *) &key->saddr;
+        struct sockaddr_in6 * s6 = (struct sockaddr_in6 *) addr;
+        memcpy(&key6->sin6_addr, &s6->sin6_addr, sizeof(struct in6_addr));
+        key6->sin6_family = s6->sin6_family;
+        key6->sin6_port = s6->sin6_port;
+        /* TODO: special code for local addresses may be needed if scope is specified */
+    }
+}
+
+int picoquic_register_net_id(picoquic_quic_t* quic, picoquic_cnx_t* cnx, struct sockaddr* addr)
+{
+    int ret = 0;
+    picoquic_net_id* key = (picoquic_net_id*)malloc(sizeof(picoquic_net_id));
+
+    if (key == NULL) {
+        ret = -1;
+    } else {
+        picohash_item* item;
+        picoquic_set_hash_key_by_address(key, addr);
+
+        key->cnx = cnx;
+
+        item = picohash_retrieve(quic->table_cnx_by_net, key);
+
+        if (item != NULL) {
+            ret = -1;
+        } else {
+            ret = picohash_insert(quic->table_cnx_by_net, key);
+
+            if (ret == 0) {
+                key->next_net_id = cnx->first_net_id;
+                cnx->first_net_id = key;
+            }
+        }
+    }
+
+    if (key != NULL && ret != 0) {
+        free(key);
+    }
+
+    return ret;
+}
+
+void picoquic_init_transport_parameters(picoquic_tp_t* tp, int client_mode)
+{
+    tp->initial_max_stream_data_bidi_local = 0x200000;
+    tp->initial_max_stream_data_bidi_remote = 65635;
+    tp->initial_max_stream_data_uni = 65535;
+    tp->initial_max_data = 0x100000;
+    tp->initial_max_streams_bidi = 10000;
+    tp->initial_max_streams_uni = 10000;
+    tp->max_idle_timeout = PICOQUIC_MICROSEC_HANDSHAKE_MAX/1000;
+    tp->max_packet_size = PICOQUIC_PRACTICAL_MAX_MTU;
+    tp->ack_delay_exponent = 3;
+    tp->max_ack_delay = 25;
+    tp->active_connection_id_limit = 2;
+    tp->supported_plugins = NULL;
+    tp->plugins_to_inject = NULL;
+}
+
+
+/* management of the list of connections in context */
+/*
+* 获取quic的cnx列表的第一个cnx
+*/
+picoquic_cnx_t* picoquic_get_first_cnx(picoquic_quic_t* quic)
+{
+    return quic->cnx_list;
+}
+
+/*
+* 获取当前cnx的下一个cnx
+*/
+picoquic_cnx_t* picoquic_get_next_cnx(picoquic_cnx_t* cnx)
+{
+    return cnx->next_in_table;
+}
+
+/*
+* 这一部分的作用分两种（总结就是把传入的cnx“往前”插入到quic的cnx列表中，并更新list指向这一个传入的cnx）：
+* 1. 如果当前quic的cnx_list没有指向任何cnx，也就是quic的cnx列表为空时，那么就将quic的list和last都指向传入的这个cnx
+*    同时让cnx的前一个cnx和后一个cnx都置为空；
+* 2. 如果当前quic的cnx_list不为空，也就是quic的cnx列表不为空，那么就把传入的cnx插入到list指向的cnx的previous_in_table，
+     也就是前一个cnx处，然后让这个传入的cnx的后一个cnx变为list所指向的cnx，也就是让建立链表，
+     之后将list指向这个传入的cnx，也就是说明list永远指向cnx列表的第一个，而last则是指向最后一个
+     最后将传入cnx的前一个置为空；
+*/
+static void picoquic_insert_cnx_in_list(picoquic_quic_t* quic, picoquic_cnx_t* cnx)
+{
+    if (quic->cnx_list != NULL) {
+        quic->cnx_list->previous_in_table = cnx;
+        cnx->next_in_table = quic->cnx_list;
+    } else {
+        quic->cnx_last = cnx;
+        cnx->next_in_table = NULL;
+    }
+    quic->cnx_list = cnx;
+    cnx->previous_in_table = NULL;
+}
+
+static void picoquic_remove_cnx_from_list(picoquic_cnx_t* cnx)
+{
+    if (cnx->next_in_table == NULL) {
+        cnx->quic->cnx_last = cnx->previous_in_table;
+    } else {
+        cnx->next_in_table->previous_in_table = cnx->previous_in_table;
+    }
+
+    if (cnx->previous_in_table == NULL) {
+        cnx->quic->cnx_list = cnx->next_in_table;
+    }
+    else {
+        cnx->previous_in_table->next_in_table = cnx->next_in_table;
+    }
+}
+
+/* Management of the list of connections, sorted by wake time */
+
+static void picoquic_remove_cnx_from_wake_list(picoquic_cnx_t* cnx)
+{
+    if (cnx->next_by_wake_time == NULL) {
+        cnx->quic->cnx_wake_last = cnx->previous_by_wake_time;
+    } else {
+        cnx->next_by_wake_time->previous_by_wake_time = cnx->previous_by_wake_time;
+    }
+
+    if (cnx->previous_by_wake_time == NULL) {
+        cnx->quic->cnx_wake_first = cnx->next_by_wake_time;
+    } else {
+        cnx->previous_by_wake_time->next_by_wake_time = cnx->next_by_wake_time;
+    }
+}
+
+static void picoquic_insert_cnx_by_wake_time(picoquic_quic_t* quic, picoquic_cnx_t* cnx)
+{
+    picoquic_cnx_t * cnx_next = quic->cnx_wake_first;
+    picoquic_cnx_t * previous = NULL;
+    while (cnx_next != NULL && cnx_next->next_wake_time <= cnx->next_wake_time) {
+        previous = cnx_next;
+        cnx_next = cnx_next->next_by_wake_time;
+    }
+
+    cnx->previous_by_wake_time = previous;
+    if (previous == NULL) {
+        quic->cnx_wake_first = cnx;
+
+    } else {
+        previous->next_by_wake_time = cnx;
+    }
+
+    cnx->next_by_wake_time = cnx_next;
+
+    if (cnx_next == NULL) {
+        quic->cnx_wake_last = cnx;
+    } else {
+        cnx_next->previous_by_wake_time = cnx;
+    }
+}
+
+void picoquic_reinsert_by_wake_time(picoquic_quic_t* quic, picoquic_cnx_t* cnx, uint64_t next_time)
+{
+    picoquic_remove_cnx_from_wake_list(cnx);
+    cnx->next_wake_time = next_time;
+    picoquic_insert_cnx_by_wake_time(quic, cnx);
+}
+
+void picoquic_reinsert_cnx_by_wake_time(picoquic_cnx_t* cnx, uint64_t next_time)
+{
+    picoquic_reinsert_by_wake_time(cnx->quic, cnx, next_time);
+}
+
+picoquic_cnx_t* picoquic_get_earliest_cnx_to_wake(picoquic_quic_t* quic, picoquic_cnx_t** cnx, uint64_t max_wake_time)
+{//max_wake_time指的是唤醒的时间，一般输入的值是当前的时间
+    picoquic_cnx_t * cnx_tmp = quic->cnx_wake_first;//这里取出首个cnx
+    
+    /*find out cnx by wake time suited for cnx_id*/
+    if (cnx && *cnx) {   
+        while (cnx_tmp) {
+            if (*cnx == cnx_tmp) {
+                break;
+            }
+            else {
+                cnx_tmp = cnx_tmp->next_by_wake_time;
+            }
+        }
+    }
+
+    if (cnx_tmp != NULL && max_wake_time != 0 && cnx_tmp->next_wake_time > max_wake_time)
+        //如果当前cnx存在且输入的当前时间不为0，
+        //那么如果当前cnx的下一个唤醒时间大于当前时间，意味着cnx目前还不能被唤醒，所以将cnx指针置为空并返回，
+        //如果下一个唤醒时间在当前时间之前，意味着可以唤醒，即返回这个cnx指标；
+    {
+        cnx_tmp = NULL;
+    }
+
+    return cnx_tmp;
+}
+
+
+int64_t picoquic_get_next_wake_delay(picoquic_quic_t* quic,
+    uint64_t current_time, int64_t delay_max)
+{
+    int64_t wake_delay = delay_max;
+
+    if (quic->cnx_wake_first != NULL) {
+        if (quic->cnx_wake_first->next_wake_time > current_time) {
+            wake_delay = quic->cnx_wake_first->next_wake_time - current_time;//下一次发送数据的时间减去当前时间
+
+            if (wake_delay > delay_max) {
+                wake_delay = delay_max;
+            }
+        }
+        else {
+            wake_delay = 0;
+        }
+    } else {
+        wake_delay = delay_max;
+    }
+
+    return wake_delay;
+}
+
+/* Other context management functions */
+
+int picoquic_get_version_index(uint32_t proposed_version)
+{
+    int ret = -1;
+
+    for (size_t i = 0; i < picoquic_nb_supported_versions; i++) {
+        if (picoquic_supported_versions[i].version == proposed_version) {
+            ret = (int)i;
+            break;
+        }
+    }
+
+    return ret;
+}
+
+uint32_t picoquic_transport_param_to_stream_id(uint16_t rank, int client_mode, int stream_type) {
+    uint32_t stream_id = 0;
+
+    if (rank > 0) {
+        stream_type |= (client_mode == 0) ? PICOQUIC_STREAM_ID_SERVER_INITIATED : PICOQUIC_STREAM_ID_CLIENT_INITIATED;
+
+        if (stream_type == 0) {
+            stream_id = 4 * rank;
+        }
+        else {
+            stream_id = 4 * (rank - 1) + stream_type;
+        }
+    }
+
+    return stream_id;
+}
+
+int picoquic_create_path(picoquic_cnx_t* cnx, uint64_t start_time, struct sockaddr* addr)
+{
+    int ret = -1;
+    /* {
+        DBG_PRINTF("picoquic_create_path\n");
+        //LG << "QUICCnxRcv" << std::endl;
+        char ipStr[INET_ADDRSTRLEN];
+        //char ipStr6[INET_ADDRSTRLEN];
+        struct sockaddr_in* ipv4 = &addr;
+        //struct sockaddr_in* ipv6 = &addr_to;
+        inet_ntop(AF_INET, &(ipv4->sin_addr), ipStr, INET_ADDRSTRLEN);
+        //inet_ntop(AF_INET, &(ipv6->sin_addr), ipStr6, INET_ADDRSTRLEN);
+        int port = ntohs(ipv4->sin_port);
+        //int port6 = ntohs(ipv6->sin_port);
+        char adrs = ipStr + port;
+        //char adrs6 = ipStr6 + port6;
+        DBG_PRINTF("the receiver: %s\n", adrs);
+        //DBG_PRINTF("the sender: %s\n", adrs6);
+        //std::lock_guard<std::mutex> lock(m_mu_);
+        //LG << "the receiver: " << adrs << std::endl;
+        //LG << "the sender: " << adrs6 << std::endl;
+    }*/
+
+    if (cnx->nb_paths >= cnx->nb_path_alloc)
+    {
+        int new_alloc = (cnx->nb_path_alloc == 0) ? 1 : 2 * cnx->nb_path_alloc;
+        picoquic_path_t ** new_path = (picoquic_path_t **)malloc(new_alloc * sizeof(picoquic_path_t *));
+
+        if (new_path != NULL)
+        {
+            if (cnx->path != NULL)
+            {
+                if (cnx->nb_paths > 0)
+                {
+                    memcpy(new_path, cnx->path, cnx->nb_paths * sizeof(picoquic_path_t *));
+                }
+                free(cnx->path);
+            }
+            cnx->path = new_path;
+            cnx->nb_path_alloc = new_alloc;
+        }
+    }
+
+    if (cnx->nb_paths < cnx->nb_path_alloc)
+    {
+        picoquic_path_t * path_x = (picoquic_path_t *)malloc(sizeof(picoquic_path_t));
+
+        if (path_x != NULL)
+        {
+            memset(path_x, 0, sizeof(picoquic_path_t));
+
+            /* Set the peer address */
+            path_x->peer_addr_len = (int)((addr->sa_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
+            memcpy(&path_x->peer_addr, addr, path_x->peer_addr_len);
+            /*
+            {
+                DBG_PRINTF("picoquic_create_path\n");
+                char ipStr[INET_ADDRSTRLEN];
+                struct sockaddr_in* ipv4 = (struct sockaddr_in*)&path_x->peer_addr;
+                inet_ntop(AF_INET, &(ipv4->sin_addr), ipStr, INET_ADDRSTRLEN);
+                int port = ntohs(ipv4->sin_port);
+                DBG_PRINTF("addr_from = %s:%d\n", ipStr, port);
+            }
+            */
+            /* Set the challenge used for this path */
+            path_x->challenge = picoquic_public_random_64();
+
+            /* Initialize per path time measurement */
+            path_x->smoothed_rtt = PICOQUIC_INITIAL_RTT;
+            path_x->rtt_variant = 0;
+            path_x->retransmit_timer = PICOQUIC_INITIAL_RETRANSMIT_TIMER;
+            path_x->rtt_min = 0;
+
+            /* Initialize per path congestion control state */
+            path_x->cwin = PICOQUIC_CWIN_INITIAL;
+            path_x->bytes_in_transit = 0;
+            path_x->congestion_alg_state = NULL;
+
+            /* Initialize per path pacing state */
+            path_x->pacing_evaluation_time = start_time;
+            path_x->pacing_bucket_nanosec = 16;
+            path_x->pacing_bucket_max = 16;
+            path_x->pacing_packet_time_nanosec = 1;
+            path_x->pacing_packet_time_microsec = 1;
+
+            /* Initialize the MTU */
+            path_x->send_mtu = addr->sa_family == AF_INET ? PICOQUIC_INITIAL_MTU_IPV4 : PICOQUIC_INITIAL_MTU_IPV6;
+
+            /* Initialize the connection IDs */
+            if (cnx->quic) {//这里设置的是cnx->path中的localID，也就是SCID
+                picoquic_create_random_cnx_id(cnx->quic, &path_x->local_cnxid, cnx->quic->local_ctx_length);
+            }
+
+            path_x->remote_cnxid = picoquic_null_connection_id;
+            /* Initialize the reset secret to a random value. This
+			 * will prevent spurious matches to an all zero value, for example.
+			 * The real value will be set when receiving the transport parameters.
+			 */
+            picoquic_public_random(path_x->reset_secret, PICOQUIC_RESET_SECRET_SIZE);
+
+            path_x->nb_pkt_sent = 0;
+            path_x->bytes_send = 0;
+
+            /* Initialize packet contexts */
+            for (picoquic_packet_context_enum pc = 0;
+                pc < picoquic_nb_packet_context; pc++) {
+                path_x->pkt_ctx[pc].first_sack_item.start_of_sack_range = (uint64_t)((int64_t)-1);
+                path_x->pkt_ctx[pc].first_sack_item.end_of_sack_range = 0;
+                path_x->pkt_ctx[pc].first_sack_item.next_sack = NULL;
+                path_x->pkt_ctx[pc].highest_ack_sent = 0;
+                path_x->pkt_ctx[pc].highest_ack_time = start_time;
+                path_x->pkt_ctx[pc].time_stamp_largest_received = (uint64_t)((int64_t)-1);
+                path_x->pkt_ctx[pc].send_sequence = 0;
+                path_x->pkt_ctx[pc].nb_retransmit = 0;
+                path_x->pkt_ctx[pc].latest_retransmit_time = 0;
+                path_x->pkt_ctx[pc].latest_retransmit_cc_notification_time = 0;
+                path_x->pkt_ctx[pc].retransmit_newest = NULL;
+                path_x->pkt_ctx[pc].retransmit_oldest = NULL;
+                path_x->pkt_ctx[pc].highest_acknowledged = path_x->pkt_ctx[pc].send_sequence - 1;
+                path_x->pkt_ctx[pc].latest_time_acknowledged = start_time;
+                path_x->pkt_ctx[pc].latest_progress_time = start_time;
+                path_x->pkt_ctx[pc].ack_needed = 0;
+                path_x->pkt_ctx[pc].ack_delay_local = 10000;
+            }
+
+            /* And start the congestion algorithm */
+            if (cnx->congestion_alg != NULL) {
+                cnx->congestion_alg->alg_init(cnx, path_x);
+            }
+
+            /* Record the path */
+            cnx->path[cnx->nb_paths] = path_x;
+            ret = cnx->nb_paths++;
+
+            if (cnx->nb_paths > 1) LOG{
+                DBG_PRINTF("nb of path > 1");
+                char local_id_str[(path_x->local_cnxid.id_len * 2) + 1];
+                snprintf_bytes(local_id_str, sizeof(local_id_str), path_x->local_cnxid.id, path_x->local_cnxid.id_len);
+
+                char peer_addr_str[250];
+                inet_ntop(path_x->peer_addr_len == sizeof(struct sockaddr_in) ? AF_INET : AF_INET6, path_x->peer_addr_len == sizeof(struct sockaddr_in) ? (void *) &((struct sockaddr_in *)&path_x->peer_addr)->sin_addr : (void *) &((struct sockaddr_in6 *)&path_x->peer_addr)->sin6_addr, peer_addr_str, sizeof(peer_addr_str));
+                LOG_EVENT(cnx, "connection", "path_created", "", "{\"path\": \"%p\", \"peer_addr\": \"%s\", \"scid\": \"%s\"}", path_x, peer_addr_str, local_id_str);
+            }
+        }
+    }
+
+    return ret;
+}
+
+void picoquic_create_random_cnx_id(picoquic_quic_t* quic, picoquic_connection_id_t * cnx_id, uint8_t id_length)
+{
+    if (id_length > 0) {
+        picoquic_crypto_random(quic, cnx_id->id, id_length);
+    }
+    if (id_length < sizeof(cnx_id->id)) {
+        memset(cnx_id->id + 8, 0, sizeof(cnx_id->id) - id_length);
+    }
+    cnx_id->id_len = id_length;
+}
+
+void picoquic_create_random_cnx_id_for_cnx(picoquic_cnx_t* cnx, picoquic_connection_id_t *cnx_id, uint8_t id_length)
+{
+    picoquic_create_random_cnx_id(cnx->quic, cnx_id, id_length);
+}
+
+
+picoquic_cnx_t* picoquic_create_cnx(picoquic_quic_t* quic,
+    picoquic_connection_id_t initial_cnx_id, picoquic_connection_id_t remote_cnx_id,
+    struct sockaddr* addr, uint64_t start_time, uint32_t preferred_version,
+    char const* sni, char const* alpn, char client_mode)
+{
+    picoquic_cnx_t* cnx = (picoquic_cnx_t*)malloc(sizeof(picoquic_cnx_t));//创建cnx，并动态分配内存
+
+    if (cnx != NULL) {
+        int ret;
+
+        memset(cnx, 0, sizeof(picoquic_cnx_t));//初始化cnx清空置零
+
+        cnx->quic = quic;//将cnx连接至总上下文
+        cnx->client_mode = client_mode;//赋予当前连接的端口属性，服务端亦或客户端，这里的client_mode并不是就指客户端       
+        /* Should return 0, since this is the first path */
+        ret = picoquic_create_path(cnx, start_time, addr);//创建不同数量的path，这个数量和cnx中的path_alloc有关
+        //同时创建了cnx->path中的localID也就是后续的SCID，随机值，同时将remoteID设置为nullID
+
+        if (ret != 0) {
+            free(cnx);
+            cnx = NULL;
+        } else {
+            cnx->next_wake_time = start_time;
+            cnx->start_time = start_time;
+
+            picoquic_insert_cnx_in_list(quic, cnx);
+            picoquic_insert_cnx_by_wake_time(quic, cnx);
+            /* Do not require verification for default path */
+            cnx->path[0]->challenge_verified = 1;
+        }
+    }
+
+    if (cnx != NULL) {
+        if (quic->default_tp == NULL) {
+            picoquic_init_transport_parameters(&cnx->local_parameters, cnx->client_mode);
+        } else {
+            memcpy(&cnx->local_parameters, quic->default_tp, sizeof(picoquic_tp_t));
+        }
+        if (cnx->quic->mtu_max > 0)
+        {
+            cnx->local_parameters.max_packet_size = cnx->quic->mtu_max;
+        }
+
+        cnx->first_stream= NULL;
+        cnx->dml = 0;
+        /* Initialize local flow control variables to advertised values */
+        cnx->maxdata_local = ((uint64_t)cnx->local_parameters.initial_max_data);
+        cnx->max_stream_id_bidir_local = picoquic_transport_param_to_stream_id(cnx->local_parameters.initial_max_streams_bidi, cnx->client_mode, PICOQUIC_STREAM_ID_BIDIR);
+        cnx->max_stream_id_bidir_local_computed = cnx->max_stream_id_bidir_local;
+        cnx->max_stream_id_unidir_local = picoquic_transport_param_to_stream_id(cnx->local_parameters.initial_max_streams_uni, cnx->client_mode, PICOQUIC_STREAM_ID_UNIDIR);
+        cnx->max_stream_id_unidir_local_computed = cnx->max_stream_id_unidir_local;
+
+        /* Initialize remote variables to some plausible value.
+		 * Hopefully, this will be overwritten by the parameters received in
+		 * the TLS transport parameter extension */
+        cnx->maxdata_remote = PICOQUIC_DEFAULT_0RTT_WINDOW;
+        cnx->remote_parameters.initial_max_stream_data_bidi_remote = PICOQUIC_DEFAULT_0RTT_WINDOW;
+        cnx->remote_parameters.initial_max_stream_data_uni = PICOQUIC_DEFAULT_0RTT_WINDOW;
+        cnx->max_stream_id_bidir_remote = (cnx->client_mode)?4:0;
+        cnx->max_stream_id_unidir_remote = 0;
+
+        if (sni != NULL) {
+            cnx->sni = picoquic_string_duplicate(sni);
+        }
+
+        if (alpn != NULL) {
+            cnx->alpn = picoquic_string_duplicate(alpn);
+        }
+
+        /*Initial local id and remote id*/
+        //cnx->local_id = local_id;
+        //cnx->remote_id = remote_id;
+
+        cnx->callback_fn = quic->default_callback_fn;
+        cnx->callback_ctx = quic->default_callback_ctx;
+        cnx->congestion_alg = quic->default_congestion_alg;
+
+        if (cnx->client_mode) {
+            if (preferred_version == 0) {
+                cnx->proposed_version = picoquic_supported_versions[0].version;
+                cnx->version_index = 0;
+            } else {
+                cnx->version_index = picoquic_get_version_index(preferred_version);
+                if (cnx->version_index < 0) {
+                    cnx->version_index = PICOQUIC_INTEROP_VERSION_INDEX;
+                    if ((preferred_version & 0x0A0A0A0A) == 0x0A0A0A0A) {
+                        /* This is a hack, to allow greasing the cnx ID */
+                        cnx->proposed_version = preferred_version;
+
+                    } else {
+                        cnx->proposed_version = picoquic_supported_versions[PICOQUIC_INTEROP_VERSION_INDEX].version;
+                    }
+                } else {
+                    cnx->proposed_version = preferred_version;
+                }
+            }
+
+            cnx->cnx_state = picoquic_state_client_init;//这一步将当前连接状态设置为init，也即创建连接时，即设置为init状态
+            if (picoquic_is_connection_id_null(initial_cnx_id)) {//判断初始id是否为null，这里是通过长度是否等于0来判断
+                picoquic_create_random_cnx_id(quic, &initial_cnx_id, 8);//创建随机初始ID，这里是客户端的init数据包中的DCID
+            }
+
+            if (quic->cnx_id_callback_fn) {
+                quic->cnx_id_callback_fn(cnx->path[0]->local_cnxid, picoquic_null_connection_id, quic->cnx_id_callback_ctx, &cnx->path[0]->local_cnxid);
+            }
+
+            cnx->initial_cnxid = initial_cnx_id;//将客户端的initialID修改为这里创建的ID，也就是client端init数据包中的DCID
+        } else {//server端接收到来自client端的initial 数据包之后的反应
+            for (int epoch = 0; epoch < PICOQUIC_NUMBER_OF_EPOCHS; epoch++) {
+                cnx->tls_stream[epoch].send_queue = NULL;//将4轮tls_stream的发送队列清空
+            }
+            cnx->cnx_state = picoquic_state_server_init;//设置连接初始状态
+            cnx->initial_cnxid = initial_cnx_id;//可以看到，Server端的初始ID，最开始是被设置为空的
+            cnx->path[0]->remote_cnxid = remote_cnx_id;//这里remoteID设置为空
+            cnx->active_connection_id_count = 1;
+
+            //init msg_data
+            cnx->msg_data = (char*)malloc(1536);
+            //DBG_PRINTF("msg_data:%p", cnx->msg_data);
+            picoquic_reset_msg_size(cnx);
+            picoquic_set_msg_state(cnx, 0);
+            //cnx->msg_done = 0;
+            cnx->msg_capacity = 1536;
+
+            if (quic->cnx_id_callback_fn)
+                quic->cnx_id_callback_fn(cnx->path[0]->local_cnxid, cnx->initial_cnxid,
+                    quic->cnx_id_callback_ctx, &cnx->path[0]->local_cnxid);
+
+            (void)picoquic_create_cnxid_reset_secret(quic, &cnx->path[0]->local_cnxid,
+                cnx->path[0]->reset_secret);
+
+            cnx->version_index = picoquic_get_version_index(preferred_version);
+            if (cnx->version_index < 0) {
+                /* TODO: this is an internal error condition, should not happen */
+                cnx->version_index = 0;
+                cnx->proposed_version = picoquic_supported_versions[0].version;
+            } else {
+                cnx->proposed_version = preferred_version;
+            }
+        }
+
+        if (cnx != NULL) {
+            /* Moved packet context initialization into path creation */
+
+            cnx->latest_progress_time = start_time;
+            cnx->local_parameters.initial_source_connection_id = cnx->path[0]->local_cnxid;
+
+            for (int epoch = 0; epoch < PICOQUIC_NUMBER_OF_EPOCHS; epoch++) {
+                cnx->tls_stream[epoch].stream_id = 0;
+                cnx->tls_stream[epoch].consumed_offset = 0;
+                cnx->tls_stream[epoch].fin_offset = 0;
+                cnx->tls_stream[epoch].next_stream = NULL;
+                cnx->tls_stream[epoch].stream_data = NULL;
+                cnx->tls_stream[epoch].sent_offset = 0;
+                cnx->tls_stream[epoch].local_error = 0;
+                cnx->tls_stream[epoch].remote_error = 0;
+                cnx->tls_stream[epoch].maxdata_local = (uint64_t)((int64_t)-1);
+                cnx->tls_stream[epoch].maxdata_remote = (uint64_t)((int64_t)-1);
+                /* No need to reset the state flags, as they are not used for the crypto stream */
+            }
+
+            cnx->congestion_alg = cnx->quic->default_congestion_alg;
+            if (cnx->congestion_alg != NULL) {
+                cnx->congestion_alg->alg_init(cnx, cnx->path[0]);
+            }
+        }
+    }
+
+    if (cnx != NULL) {
+        register_protocol_operations(cnx);
+        /* It's already the time to inject plugins, as creating the TLS context sets up the transport parameters */
+        if (quic->local_plugins.size > 0) {
+            int err = plugin_insert_plugins(cnx, quic->local_plugins.size, quic->local_plugins.elems);
+            if (err) {
+                cnx = NULL;
+            }
+        }
+    }
+
+    /* Only initialize TLS after all parameters have been set */
+
+    if (cnx != NULL) {
+        if (picoquic_tlscontext_create(quic, cnx, start_time) != 0) {
+            /* Cannot just do partial creation! */
+            picoquic_delete_cnx(cnx);
+            cnx = NULL;
+        }
+    }
+
+    if (cnx != NULL) {
+        if (picoquic_setup_initial_traffic_keys(cnx)) {
+            /* Cannot initialize aead for initial packets */
+            picoquic_delete_cnx(cnx);
+            cnx = NULL;
+        }
+    }
+
+    //这一步相当于是为该cnx注册了两种查询方式，一是通过DCID，一是通过addr（如果都存在的话）
+    if (cnx != NULL) {
+        if (!picoquic_is_connection_id_null(cnx->path[0]->local_cnxid)) {
+            //如果是client的init数据包，那就是SCID，也就是之后server端的DCID
+            //如果创建cnx的时候设置了DCID，那么就根据DCIC来注册该cnx到quic上下文的哈希表中
+            (void)picoquic_register_cnx_id(quic, cnx, &cnx->path[0]->local_cnxid);
+        }
+
+        if (addr != NULL) {
+            //创建cnx时，如果传入的addr不为空，也会根据addr将该cnx注册到quic上下文的哈希表中
+            (void)picoquic_register_net_id(quic, cnx, addr);
+        }
+    }
+
+    if (cnx != NULL) {
+        /* Also initialize reserve queue */
+        cnx->reserved_frames = queue_init();
+        /* And the retry queue */
+        cnx->retry_frames = queue_init();
+        for (int pc = 0; pc < picoquic_nb_packet_context; pc++) {
+            cnx->rtx_frames[pc] = queue_init();
+        }
+        /* TODO change this arbitrary value */
+        cnx->core_rate = 500;
+    }
+
+    return cnx;
+}
+
+picoquic_cnx_t* picoquic_create_client_cnx(picoquic_quic_t* quic,
+    struct sockaddr* addr, uint64_t start_time, uint32_t preferred_version,
+    char const* sni, char const* alpn, picoquic_stream_data_cb_fn callback_fn, void* callback_ctx)
+{
+    picoquic_cnx_t* cnx = picoquic_create_cnx(quic, picoquic_null_connection_id, picoquic_null_connection_id, addr, start_time, preferred_version, sni, alpn, 1);
+
+    if (cnx != NULL) {
+        int ret;
+
+        if (callback_fn != NULL)
+            cnx->callback_fn = callback_fn;
+        if (callback_ctx != NULL)
+            cnx->callback_ctx = callback_ctx;
+        ret = picoquic_initialize_tls_stream(cnx);
+        if (ret != 0) {
+            /* Cannot just do partial initialization! */
+            picoquic_delete_cnx(cnx);
+            cnx = NULL;
+        }
+    }
+
+    return cnx;
+}
+
+void register_protocol_operations(picoquic_cnx_t *cnx)
+{
+    /* First ensure that ops is set to NULL, required by uthash.h */
+    cnx->ops = NULL;
+    cnx->plugins = NULL;
+    cnx->current_plugin = NULL;
+    cnx->previous_plugin_in_replace = NULL;
+    packet_register_noparam_protoops(cnx);
+    frames_register_noparam_protoops(cnx);
+    sender_register_noparam_protoops(cnx);
+    quicctx_register_noparam_protoops(cnx);
+}
+
+int picoquic_start_client_cnx(picoquic_cnx_t * cnx)
+{
+    int ret = picoquic_initialize_tls_stream(cnx);
+
+    picoquic_cnx_set_next_wake_time(cnx, picoquic_get_quic_time(cnx->quic)/*若总上下文quic中没有设置时间，则直接返回当前时间*/);
+
+    return ret;
+}
+
+void picoquic_set_transport_parameters(picoquic_cnx_t * cnx, picoquic_tp_t * tp)
+{
+    cnx->local_parameters = *tp;
+
+    if (cnx->quic->mtu_max > 0)
+    {
+        cnx->local_parameters.max_packet_size = cnx->quic->mtu_max;
+    }
+
+    /* Initialize local flow control variables to advertised values */
+
+    cnx->maxdata_local = ((uint64_t)cnx->local_parameters.initial_max_data);
+    cnx->max_stream_id_bidir_local = picoquic_transport_param_to_stream_id(cnx->local_parameters.initial_max_streams_bidi, cnx->client_mode, PICOQUIC_STREAM_ID_BIDIR);
+    cnx->max_stream_id_unidir_local = picoquic_transport_param_to_stream_id(cnx->local_parameters.initial_max_streams_uni, cnx->client_mode, PICOQUIC_STREAM_ID_UNIDIR);
+}
+
+picoquic_path_t* picoquic_get_connection_path(picoquic_cnx_t* cnx)
+{
+    /* Return the initial path */
+    return cnx->path[0];
+}
+
+void picoquic_get_peer_addr(picoquic_path_t* path_x, struct sockaddr** addr, int* addr_len)
+{
+    *addr = (struct sockaddr*)&path_x->peer_addr;
+    *addr_len = path_x->peer_addr_len;
+}
+
+void picoquic_get_local_addr(picoquic_path_t* path_x, struct sockaddr** addr, int* addr_len)
+{
+    *addr = (struct sockaddr*)&path_x->local_addr;
+    *addr_len = path_x->local_addr_len;
+}
+
+unsigned long picoquic_get_local_if_index(picoquic_path_t* path_x)
+{
+    return path_x->if_index_local;
+}
+
+picoquic_connection_id_t picoquic_get_local_cnxid(picoquic_cnx_t* cnx)
+{
+    return cnx->path[0]->local_cnxid;
+}
+
+picoquic_connection_id_t picoquic_get_remote_cnxid(picoquic_cnx_t* cnx)
+{
+    return cnx->path[0]->remote_cnxid;
+}
+
+picoquic_connection_id_t picoquic_get_initial_cnxid(picoquic_cnx_t* cnx)
+{
+    return cnx->initial_cnxid;
+}
+
+picoquic_connection_id_t picoquic_get_client_cnxid(picoquic_cnx_t* cnx)
+{
+    return (cnx->client_mode)?cnx->path[0]->local_cnxid: cnx->path[0]->remote_cnxid;
+}
+
+picoquic_connection_id_t picoquic_get_server_cnxid(picoquic_cnx_t* cnx)
+{
+    return (cnx->client_mode) ? cnx->path[0]->remote_cnxid : cnx->path[0]->local_cnxid;
+}
+
+picoquic_connection_id_t picoquic_get_logging_cnxid(picoquic_cnx_t* cnx)
+{
+    return cnx->initial_cnxid;
+}
+
+uint64_t picoquic_get_cnx_start_time(picoquic_cnx_t* cnx)
+{
+    return cnx->start_time;
+}
+
+picoquic_state_enum picoquic_get_cnx_state(picoquic_cnx_t* cnx)
+{
+    return cnx->cnx_state;
+}
+
+int picoquic_get_msg_state(picoquic_cnx_t* cnx) {
+    return cnx->msg_done;
+}
+
+void picoquic_set_msg_state(picoquic_cnx_t* cnx, int done) {
+    cnx->msg_done = done;
+}
+
+void picoquic_reset_msg_size(picoquic_cnx_t* cnx) {
+    cnx->msg_size = 0;
+}
+
+void picoquic_set_cnx_state(picoquic_cnx_t* cnx, picoquic_state_enum state)
+{
+    picoquic_state_enum previous_state = cnx->cnx_state;
+    cnx->cnx_state = state;
+    if(previous_state != cnx->cnx_state) {
+        LOG_EVENT(cnx, "connection", "new_state", "", "{\"state\": \"%s\"}", picoquic_log_state_name(cnx->cnx_state));
+        protoop_prepare_and_run_noparam(cnx, &PROTOOP_NOPARAM_CONNECTION_STATE_CHANGED, NULL,
+            previous_state, state);
+    }
+}
+
+uint64_t picoquic_is_0rtt_available(picoquic_cnx_t* cnx)
+{
+    return (cnx->crypto_context[1].aead_encrypt == NULL) ? 0 : 1;
+}
+
+/* Return the index in the list of pid, or the size of the list otherwise */
+int picoquic_pid_index(plugin_list_t* list, char* pid)
+{
+    for (int j = 0; j < list->size; j++) {
+        if (strcmp(list->elems[j].plugin_name, pid) == 0) {
+            return j;
+        }
+    }
+    return list->size;
+}
+
+void handle_plugin_to_negotiate(picoquic_cnx_t* cnx)
+{
+    protoop_plugin_t *current_plugin, *tmp_plugin;
+    protoop_arg_t status;
+    char *error_msg = NULL;
+    int err;
+    HASH_ITER(hh, cnx->plugins, current_plugin, tmp_plugin) {
+        if (current_plugin->params.require_negotiation && current_plugin->params.negotiated) {
+            /* Excellent, we just need to inject the postplugins */
+            err = plugin_insert_post_plugin(cnx, current_plugin);
+            if (err) {
+                printf("Failed to inject post plugins for %s\n", current_plugin->name);
+            } else {
+                printf("Successfully injected post plugins for %s\n", current_plugin->name);
+            }
+        }
+    }
+}
+
+int picoquic_handle_plugin_negotiation_client(picoquic_cnx_t* cnx)
+{
+    /* First handle plugins to negotiate */
+    handle_plugin_to_negotiate(cnx);
+
+    /* If there is no plugins_to_inject remote parameter, stop now */
+    if (!cnx->remote_parameters.plugins_to_inject) {
+        return 0;
+    }
+    /* If we don't have any plugin store, don't request any plugin! */
+    if (cnx->quic->plugin_store_path == NULL) {
+        return 0;
+    }
+    /* The client can inject all plugins required that it already supports. */
+    char **pids_to_inject = picoquic_string_split(cnx->remote_parameters.plugins_to_inject, ',');
+    char *pid_to_inject;
+    int index;
+    plugin_list_t* supported_plugins = &cnx->quic->supported_plugins;
+    if (pids_to_inject) {
+        plugin_fname_t plugins[supported_plugins->size];
+        uint8_t nb_plugins = 0;
+
+        for (int i = 0; (pid_to_inject = pids_to_inject[i]) != NULL; i++) {
+            /* Search in the supported plugins */
+            index = picoquic_pid_index(supported_plugins, pid_to_inject);
+
+            if (index < supported_plugins->size) {
+                plugins[nb_plugins] = supported_plugins->elems[index];
+                nb_plugins++;
+            } else {
+                fprintf(stderr, "Client does not support plugin %s, request it.\n", pid_to_inject);
+                size_t pid_len = strlen(pid_to_inject) + 1;
+                cnx->pids_to_request.elems[cnx->pids_to_request.size].plugin_name = malloc(sizeof(char) * (pid_len));
+                if (cnx->pids_to_request.elems[cnx->pids_to_request.size].plugin_name == NULL) {
+                    fprintf(stderr, "Client cannot allocate memory to request %s!\n", pid_to_inject);
+                } else {
+                    cnx->pids_to_request.elems[cnx->pids_to_request.size].data = malloc(sizeof(uint8_t) * MAX_PLUGIN_DATA_LEN);
+                    if (cnx->pids_to_request.elems[cnx->pids_to_request.size].data == NULL) {
+                        fprintf(stderr, "Client cannot allocate memory to request %s!\n", pid_to_inject);
+                        free(cnx->pids_to_request.elems[cnx->pids_to_request.size].plugin_name);
+                        cnx->pids_to_request.elems[cnx->pids_to_request.size].plugin_name = NULL;
+                    } else {
+                        memcpy(cnx->pids_to_request.elems[cnx->pids_to_request.size].plugin_name, pid_to_inject, pid_len);
+                        cnx->pids_to_request.elems[cnx->pids_to_request.size].pid_id = cnx->pids_to_request.size;
+                        cnx->pids_to_request.size++;
+                    }
+                }
+            }
+        }
+
+        /* TODO plugin loading optimisation */
+        int nb_plugins_failed = plugin_insert_plugins(cnx, nb_plugins, plugins);
+        if (nb_plugins_failed == 0) {
+            fprintf(stderr, "Client successfully inserted %u plugins\n", nb_plugins);
+        } else {
+            fprintf(stderr, "Client failed to insert %d plugins\n", nb_plugins_failed);
+        }
+        free(pids_to_inject);
+    }
+
+    return 0;
+}
+
+int picoquic_handle_plugin_negotiation_server(picoquic_cnx_t* cnx)
+{
+    /* First handle plugins to negotiate */
+    handle_plugin_to_negotiate(cnx);
+
+    /* If there is no supported_plugins remote parameter, stop now */
+    if (!cnx->remote_parameters.supported_plugins) {
+        return 0;
+    }
+    char **supported_pids = picoquic_string_split(cnx->remote_parameters.supported_plugins, ',');
+    char *supported_pid;
+    int index;
+    plugin_list_t* plugins_to_inject = &cnx->quic->plugins_to_inject;
+    if (supported_pids) {
+        plugin_fname_t plugins[plugins_to_inject->size];
+        uint8_t nb_plugins = 0;
+
+        for (int i = 0; (supported_pid = supported_pids[i]) != NULL; i++) {
+            /* Search in the plugins to inject */
+            index = picoquic_pid_index(plugins_to_inject, supported_pid);
+
+            if (index < plugins_to_inject->size) {
+                plugins[nb_plugins] = plugins_to_inject->elems[index];
+                nb_plugins++;
+            }
+        }
+        /* TODO plugin loading optimisation */
+        int nb_plugins_failed = plugin_insert_plugins(cnx, nb_plugins, plugins);
+        if (nb_plugins_failed == 0) {
+            fprintf(stderr, "Server successfully inserted %u plugins\n", nb_plugins);
+        } else {
+            fprintf(stderr, "Server failed to insert %d plugins\n", nb_plugins_failed);
+        }
+        free(supported_pids);
+    }
+
+    return 0;
+}
+
+/* Handle plugin negotiation */
+int picoquic_handle_plugin_negotiation(picoquic_cnx_t* cnx)
+{
+    /* This function should be called once transport parameters have been exchanged */
+    if (!cnx->remote_parameters_received) {
+        DBG_PRINTF("Trying to handle plugin negotiation before having received remote transport parameters!\n");
+        return 1;
+    }
+
+    int err;
+
+    /* XXX So far, we only allow remote injection from server to client */
+    if (picoquic_is_client(cnx)) {
+        err = picoquic_handle_plugin_negotiation_client(cnx);
+    } else {
+        err = picoquic_handle_plugin_negotiation_server(cnx);
+    }
+
+    return err;
+}
+
+/*
+ * Provide clock time
+ */
+uint64_t picoquic_current_time()
+{
+    uint64_t now;
+#ifdef _WINDOWS
+    FILETIME ft;
+    /*
+    * The GetSystemTimeAsFileTime API returns  the number
+    * of 100-nanosecond intervals since January 1, 1601 (UTC),
+    * in FILETIME format.
+    */
+    GetSystemTimeAsFileTime(&ft);
+
+    /*
+    * Convert to plain 64 bit format, without making
+    * assumptions about the FILETIME structure alignment.
+    */
+    now = ft.dwHighDateTime;
+    now <<= 32;
+    now |= ft.dwLowDateTime;
+    /*
+    * Convert units from 100ns to 1us
+    */
+    now /= 10;
+    /*
+    * Account for microseconds elapsed between 1601 and 1970.
+    */
+    now -= 11644473600000000ULL;
+#else
+    struct timeval tv;
+    (void)gettimeofday(&tv, NULL);
+    now = (tv.tv_sec * 1000000ull) + tv.tv_usec;
+#endif
+    return now;
+}
+
+/*
+* Get the same time simulation as used for TLS
+*/
+
+uint64_t picoquic_get_quic_time(picoquic_quic_t* quic)
+{
+    uint64_t now;
+    if (quic->p_simulated_time == NULL) {
+        now = picoquic_current_time();
+    }
+    else {
+        now = *quic->p_simulated_time;
+    }
+
+    return now;
+}
+
+void picoquic_set_fuzz(picoquic_quic_t * quic, picoquic_fuzz_fn fuzz_fn, void * fuzz_ctx)
+{
+    quic->fuzz_fn = fuzz_fn;
+    quic->fuzz_ctx = fuzz_ctx;
+}
+
+
+
+void picoquic_set_callback(picoquic_cnx_t* cnx,
+    picoquic_stream_data_cb_fn callback_fn, void* callback_ctx)
+{
+    cnx->callback_fn = callback_fn;
+    cnx->callback_ctx = callback_ctx;
+}
+
+void * picoquic_get_callback_context(picoquic_cnx_t * cnx)
+{
+    return cnx->callback_ctx;
+}
+
+
+uint8_t *picoquic_parse_ecn_block(picoquic_cnx_t* cnx, uint8_t *bytes, const uint8_t *bytes_max, void **ecn_block) {
+    protoop_arg_t outs[PROTOOPARGS_MAX];
+    bytes = (uint8_t *) protoop_prepare_and_run_noparam(cnx, &PROTOOP_NOPARAM_PARSE_ECN_BLOCK, outs, bytes, bytes_max);
+    *ecn_block = (void *) outs[0];
+    return bytes;
+}
+
+int picoquic_process_ecn_block(picoquic_cnx_t* cnx, void *ecn_block, picoquic_packet_context_t *pkt_ctx, picoquic_path_t *path) {
+    return (int) protoop_prepare_and_run_noparam(cnx, &PROTOOP_NOPARAM_PROCESS_ECN_BLOCK, NULL, ecn_block, pkt_ctx, path);
+}
+
+int picoquic_write_ecn_block(picoquic_cnx_t* cnx, uint8_t *bytes, size_t bytes_max, picoquic_packet_context_t *pkt_ctx, size_t *consumed) {
+    protoop_arg_t outs[PROTOOPARGS_MAX];
+    int ret = (int) protoop_prepare_and_run_noparam(cnx, &PROTOOP_NOPARAM_WRITE_ECN_BLOCK, outs, bytes, bytes_max, pkt_ctx);
+    *consumed = (size_t) outs[0];
+    return ret;
+}
+
+void picoquic_clear_stream(picoquic_stream_head* stream)
+{
+    picoquic_stream_data** pdata[2];
+    pdata[0] = &stream->stream_data;
+    pdata[1] = &stream->send_queue;
+
+    for (int i = 0; i < 2; i++) {
+        picoquic_stream_data* next;
+
+        while ((next = *pdata[i]) != NULL) {
+            *pdata[i] = next->next_stream_data;
+
+            if (next->bytes != NULL) {
+                free(next->bytes);
+            }
+            free(next);
+        }
+    }
+}
+
+void picoquic_reset_packet_context(picoquic_cnx_t* cnx,
+    picoquic_packet_context_enum pc, picoquic_path_t* path_x)
+{
+    /* TODO: special case for 0-RTT packets! */
+    picoquic_packet_context_t * pkt_ctx = &path_x->pkt_ctx[pc];
+
+    while (pkt_ctx->retransmit_newest != NULL) {
+        picoquic_dequeue_retransmit_packet(cnx, pkt_ctx->retransmit_newest, 1);
+    }
+
+    while (pkt_ctx->retransmitted_newest != NULL) {
+        picoquic_dequeue_retransmitted_packet(cnx, pkt_ctx->retransmitted_newest);
+    }
+
+    pkt_ctx->retransmitted_oldest = NULL;
+
+    while (pkt_ctx->first_sack_item.next_sack != NULL) {
+        picoquic_sack_item_t * next = pkt_ctx->first_sack_item.next_sack;
+        pkt_ctx->first_sack_item.next_sack = next->next_sack;
+        free(next);
+    }
+
+    pkt_ctx->first_sack_item.start_of_sack_range = (uint64_t)((int64_t)-1);
+    pkt_ctx->first_sack_item.end_of_sack_range = 0;
+
+    /* Free the metadata */
+    if (pkt_ctx->metadata) {
+        plugin_struct_metadata_t *current_md, *tmp;
+        HASH_ITER(hh, pkt_ctx->metadata, current_md, tmp) {
+            HASH_DEL(pkt_ctx->metadata, current_md);
+            free(current_md);
+        }
+    }
+}
+
+/*
+* Reset the version to a new supported value.
+*
+* Can only happen after sending the client init packet.
+* Result of reset:
+*
+* - connection ID is not changed.
+* - sequence number is not changed.
+* - all queued 0-RTT retransmission will be considered lost (to do with 0-RTT)
+* - Client Initial packet is considered lost, free. A new one will have to be formatted.
+* - Stream 0 is reset, all data is freed.
+* - TLS API is called again.
+* - State changes.
+*/
+
+int picoquic_reset_cnx(picoquic_cnx_t* cnx, uint64_t current_time)
+{
+    int ret = 0;
+
+    /* Delete the packets queued for retransmission */
+    for (picoquic_packet_context_enum pc = 0;
+        pc < picoquic_nb_packet_context; pc++) {
+        /* Do not reset the application context, in order to keep the 0-RTT
+         * packets, and to keep using the same sequence number space in
+         * the new connection */
+        if (pc != picoquic_packet_context_application) {
+            picoquic_reset_packet_context(cnx, pc, cnx->path[0]);
+        }
+    }
+
+    /* Reset the crypto stream */
+    for (int epoch = 0; epoch < PICOQUIC_NUMBER_OF_EPOCHS; epoch++) {
+        picoquic_clear_stream(&cnx->tls_stream[epoch]);
+        cnx->tls_stream[epoch].consumed_offset = 0;
+        cnx->tls_stream[epoch].fin_offset = 0;
+        cnx->tls_stream[epoch].sent_offset = 0;
+        /* No need to reset the state flags, are they are not used for the crypto stream */
+    }
+
+    for (int k = 0; k < 4; k++) {
+        picoquic_crypto_context_free(&cnx->crypto_context[k]);
+    }
+
+    if (ret == 0) {
+        ret = picoquic_setup_initial_traffic_keys(cnx);
+    }
+
+    /* Reset the TLS context, Re-initialize the tls connection */
+    if (cnx->tls_ctx != NULL) {
+        picoquic_tlscontext_free(cnx, cnx->tls_ctx);
+        cnx->tls_ctx = NULL;
+    }
+    if (ret == 0) {
+        ret = picoquic_tlscontext_create(cnx->quic, cnx, current_time);
+    }
+    if (ret == 0) {
+        ret = picoquic_initialize_tls_stream(cnx);
+    }
+
+    return ret;
+}
+
+int picoquic_reset_cnx_version(picoquic_cnx_t* cnx, uint8_t* bytes, size_t length, uint64_t current_time)
+{
+    /* First parse the incoming connection negotiation to choose the
+	* new version. If none is available, return an error */
+    int ret = -1;
+
+    if (cnx->cnx_state == picoquic_state_client_init || cnx->cnx_state == picoquic_state_client_init_sent) {
+        size_t byte_index = 0;
+        while (cnx->cnx_state != picoquic_state_client_renegotiate && byte_index + 4 <= length) {
+            uint32_t proposed_version = 0;
+            /* parsing the list of proposed versions encoded in renegotiation packet */
+            proposed_version = PICOPARSE_32(bytes + byte_index);
+            byte_index += 4;
+
+            for (size_t i = 0; i < picoquic_nb_supported_versions; i++) {
+                if (proposed_version == picoquic_supported_versions[i].version) {
+                    cnx->version_index = (int)i;
+                    picoquic_set_cnx_state(cnx, picoquic_state_client_renegotiate);
+
+                    break;
+                }
+            }
+        }
+
+        if (cnx->cnx_state != picoquic_state_client_renegotiate) {
+            /* No acceptable version */
+            ret = PICOQUIC_ERROR_UNEXPECTED_PACKET;
+        } else {
+            ret = picoquic_reset_cnx(cnx, current_time);
+        }
+    }
+    else {
+        /* Not in a state for negotiation */
+        ret = PICOQUIC_ERROR_UNEXPECTED_PACKET;
+    }
+
+    return ret;
+}
+
+/**
+ * See PROTOOP_NOPARAM_CONNECTION_ERROR
+ */
+protoop_arg_t connection_error(picoquic_cnx_t* cnx)
+{
+    uint64_t local_error = (uint64_t) cnx->protoop_inputv[0];
+    uint64_t frame_type = (uint64_t) cnx->protoop_inputv[1];
+
+    if (cnx->cnx_state == picoquic_state_client_ready || cnx->cnx_state == picoquic_state_server_ready) {
+        cnx->local_error = local_error;
+        picoquic_set_cnx_state(cnx, picoquic_state_disconnecting);
+
+        DBG_PRINTF("Protocol error (%" PRIx64 ")", local_error);
+    } else if (cnx->cnx_state < picoquic_state_client_ready) {
+        cnx->local_error = local_error;
+        picoquic_set_cnx_state(cnx, picoquic_state_handshake_failure);
+
+        DBG_PRINTF("Protocol error %" PRIx64, local_error);
+    }
+
+    cnx->offending_frame_type = frame_type;
+
+    LOG_EVENT(cnx, "connection", "connection_error", "", "{\"code\": %" PRIu64 ", \"frame_type\": %" PRIu64 "}", local_error, frame_type);
+
+    return (protoop_arg_t) PICOQUIC_ERROR_DETECTED;
+}
+
+int picoquic_connection_error(picoquic_cnx_t* cnx, uint64_t local_error, uint64_t frame_type)
+{
+    return (int) protoop_prepare_and_run_noparam(cnx, &PROTOOP_NOPARAM_CONNECTION_ERROR, NULL,
+        local_error, frame_type);
+}
+
+void picoquic_delete_cnx(picoquic_cnx_t* cnx)
+{
+    picoquic_stream_head* stream;
+
+    if (cnx != NULL) {
+        if (cnx->cnx_state < picoquic_state_disconnected) {
+            /* Give the application a chance to clean up its state */
+            picoquic_set_cnx_state(cnx, picoquic_state_disconnected);
+            if (cnx->callback_fn) {
+                (void)(cnx->callback_fn)(cnx, 0, NULL, 0, picoquic_callback_close, cnx->callback_ctx, NULL);
+            }
+        }
+
+        if (cnx->alpn != NULL) {
+            free((void*)cnx->alpn);
+            cnx->alpn = NULL;
+        }
+
+        if (cnx->sni != NULL) {
+            free((void*)cnx->sni);
+            cnx->sni = NULL;
+        }
+
+        while (cnx->first_cnx_id != NULL) {
+            picohash_item* item;
+            picoquic_cnx_id* cnx_id_key = cnx->first_cnx_id;
+            cnx->first_cnx_id = cnx_id_key->next_cnx_id;
+            cnx_id_key->next_cnx_id = NULL;
+
+            item = picohash_retrieve(cnx->quic->table_cnx_by_id, cnx_id_key);
+            if (item != NULL) {
+                picohash_item_delete(cnx->quic->table_cnx_by_id, item, 1);
+            }
+        }
+
+        while (cnx->first_net_id != NULL) {
+            picohash_item* item;
+            picoquic_net_id* net_id_key = cnx->first_net_id;
+            cnx->first_net_id = net_id_key->next_net_id;
+            net_id_key->next_net_id = NULL;
+
+            item = picohash_retrieve(cnx->quic->table_cnx_by_net, net_id_key);
+            if (item != NULL) {
+                picohash_item_delete(cnx->quic->table_cnx_by_net, item, 1);
+            }
+        }
+
+        picoquic_remove_cnx_from_list(cnx);
+        picoquic_remove_cnx_from_wake_list(cnx);
+
+        for (int i = 0; i < 4; i++) {
+            picoquic_crypto_context_free(&cnx->crypto_context[i]);
+        }
+
+        for (picoquic_packet_context_enum pc = 0;
+            pc < picoquic_nb_packet_context; pc++) {
+            for (int i = 0; i < cnx->nb_paths; i++) {
+                picoquic_reset_packet_context(cnx, pc, cnx->path[i]);
+            }
+        }
+
+        for (int epoch = 0; epoch < PICOQUIC_NUMBER_OF_EPOCHS; epoch++) {
+            picoquic_clear_stream(&cnx->tls_stream[epoch]);
+        }
+
+        while ((stream = cnx->first_stream) != NULL) {
+            cnx->first_stream = stream->next_stream;
+            picoquic_clear_stream(stream);
+            free(stream);
+        }
+
+        while ((stream = cnx->first_plugin_stream) != NULL) {
+            cnx->first_plugin_stream = stream->next_stream;
+            picoquic_clear_stream(stream);
+            free(stream);
+        }
+
+        if (cnx->tls_ctx != NULL) {
+            picoquic_tlscontext_free(cnx, cnx->tls_ctx);
+            cnx->tls_ctx = NULL;
+        }
+
+        if (cnx->path != NULL)
+        {
+            for (int i = 0; i < cnx->nb_paths; i++) {
+
+                if (cnx->congestion_alg != NULL) {
+                    cnx->congestion_alg->alg_delete(cnx, cnx->path[i]);
+                }
+
+                /* Free the metadata */
+                if (cnx->path[i]->metadata) {
+                    plugin_struct_metadata_t *current_md, *tmp;
+                    HASH_ITER(hh, cnx->path[i]->metadata, current_md, tmp) {
+                        HASH_DEL(cnx->path[i]->metadata, current_md);
+                        free(current_md);
+                    }
+                }
+                free(cnx->path[i]);
+                cnx->path[i] = NULL;
+            }
+
+            free(cnx->path);
+            cnx->path = NULL;
+        }
+
+        /* If we are the server, keep the protocol operations in the cache */
+        /* First condition is needed for tests */
+        if (cnx->quic && !picoquic_is_client(cnx)) {
+            cached_plugins_t* cached = malloc(sizeof(cached_plugins_t));
+            if (!cached) {
+                DBG_PRINTF("%s", "Cannot allocate memory to cache plugins; free them.\n");
+                picoquic_free_protoops_and_plugins(cnx);
+            } else {
+                cached->ops = cnx->ops;
+                cached->plugins = cnx->plugins;
+                cached->nb_plugins = 0;
+                protoop_plugin_t *current_p, *tmp_p;
+                HASH_ITER(hh, cached->plugins, current_p, tmp_p) {
+                    /* This remains safe to do this, as the memory of the frame context will be freed when cnx will */
+                    while(queue_peek(current_p->block_queue_cc) != NULL) {queue_dequeue(current_p->block_queue_cc);}
+                    while(queue_peek(current_p->block_queue_non_cc) != NULL) {queue_dequeue(current_p->block_queue_non_cc);}
+                    /* First destroy the memory */
+                    destroy_memory_management(current_p);
+                    /* And reinit the memory */
+                    init_memory_management(current_p);
+                    /* And copy the name of the plugin */
+                    strcpy(cached->plugin_names[cached->nb_plugins], current_p->name);
+                    /* We found one plugin, so count it! */
+                    cached->nb_plugins++;
+                }
+                int err = queue_enqueue(cnx->quic->cached_plugins_queue, cached);
+                if (err) {
+                    DBG_PRINTF("%s", "Cannot insert cached plugins; free them.\n");
+                    picoquic_free_protoops_and_plugins(cnx);
+                    free(cached);
+                }
+            }
+        } else {
+            /* Free protocol operations and plugins */
+            picoquic_free_protoops_and_plugins(cnx);
+        }
+
+        /* Free the metadata */
+        if (cnx->metadata) {
+            plugin_struct_metadata_t *current_md, *tmp;
+            HASH_ITER(hh, cnx->metadata, current_md, tmp) {
+                HASH_DEL(cnx->metadata, current_md);
+                free(current_md);
+            }
+        }
+
+        /* Free possibly allocated memory in pids to request */
+        for (int i = 0; i < cnx->pids_to_request.size; i++) {
+            if (cnx->pids_to_request.elems[i].plugin_name != NULL) {
+                free(cnx->pids_to_request.elems[i].plugin_name);
+                cnx->pids_to_request.elems[i].plugin_name = NULL;
+            }
+            if (cnx->pids_to_request.elems[i].data != NULL) {
+                free(cnx->pids_to_request.elems[i].data);
+                cnx->pids_to_request.elems[i].data = NULL;
+            }
+        }
+
+        /* Free the plugin name pointers */
+        if (cnx->local_parameters.supported_plugins != NULL) {
+            free(cnx->local_parameters.supported_plugins);
+        }
+        if (cnx->remote_parameters.supported_plugins != NULL) {
+            free(cnx->local_parameters.supported_plugins);
+        }
+        if (cnx->local_parameters.plugins_to_inject != NULL) {
+            free(cnx->local_parameters.plugins_to_inject);
+        }
+        if (cnx->remote_parameters.plugins_to_inject != NULL) {
+            free(cnx->local_parameters.plugins_to_inject);
+        }
+
+        /* Delete pending reserved frames, if any */
+        if (cnx->reserved_frames != NULL) {
+            queue_free(cnx->reserved_frames);
+        }
+        /* And also the retry frames */
+        if (cnx->retry_frames != NULL) {
+            queue_free(cnx->retry_frames);
+        }
+
+        free(cnx);
+    }
+}
+
+int picoquic_is_handshake_error(uint64_t error_code)
+{
+    return ((error_code & 0xFF00) == PICOQUIC_TRANSPORT_CRYPTO_ERROR(0) ||
+        error_code == PICOQUIC_TLS_HANDSHAKE_FAILED);
+}
+
+/* Context retrieval functions */
+picoquic_cnx_t* picoquic_cnx_by_id(picoquic_quic_t* quic, picoquic_connection_id_t cnx_id)
+{
+    picoquic_cnx_t* ret = NULL;
+    picohash_item* item;
+    picoquic_cnx_id key;
+
+    memset(&key, 0, sizeof(key));
+    key.cnx_id = cnx_id;
+
+    item = picohash_retrieve(quic->table_cnx_by_id, &key);
+
+    if (item != NULL) {
+        ret = ((picoquic_cnx_id*)item->key)->cnx;
+    }
+    return ret;
+}
+
+picoquic_cnx_t* picoquic_cnx_by_net(picoquic_quic_t* quic, struct sockaddr* addr)
+{
+    picoquic_cnx_t* ret = NULL;
+    picohash_item* item;
+    picoquic_net_id key;
+
+    //将收到的数据包(特指client initial packet)的源地址转换成sockaddr_storage形式存储至key的saddr中
+    picoquic_set_hash_key_by_address(&key, addr);
+
+    //如果是第一次接收到来自客户端的数据包，那么这里返回的应该是空值，因为并没有注册对应的cnx
+    item = picohash_retrieve(quic->table_cnx_by_net, &key);
+
+    if (item != NULL) {
+        ret = ((picoquic_net_id*)item->key)->cnx;
+    }
+    return ret;
+}
+
+/*
+ * Set or reset the congestion control algorithm
+ */
+
+void picoquic_set_default_congestion_algorithm(picoquic_quic_t* quic, picoquic_congestion_algorithm_t const* alg)
+{
+    quic->default_congestion_alg = alg;
+}
+
+void picoquic_set_congestion_algorithm(picoquic_cnx_t* cnx, picoquic_congestion_algorithm_t const* alg)
+{
+    if (cnx->congestion_alg != NULL) {
+        if (cnx->path != NULL) {
+            for (int i = 0; i < cnx->nb_paths; i++) {
+                cnx->congestion_alg->alg_delete(cnx, cnx->path[i]);
+            }
+        }
+    }
+
+    cnx->congestion_alg = alg;
+
+    if (cnx->congestion_alg != NULL) {
+        if (cnx->path != NULL) {
+            for (int i = 0; i < cnx->nb_paths; i++) {
+                cnx->congestion_alg->alg_init(cnx, cnx->path[i]);
+            }
+        }
+    }
+}
+
+/**
+ * See PROTOOP_NOPARAM_CONGESTION_ALGORITHM_NOTIFY
+ */
+protoop_arg_t congestion_algorithm_notify(picoquic_cnx_t *cnx)
+{
+    picoquic_path_t* path_x = (picoquic_path_t*) cnx->protoop_inputv[0];
+    picoquic_congestion_notification_t notification = (picoquic_congestion_notification_t) cnx->protoop_inputv[1];
+    uint64_t rtt_measurement = (uint64_t) cnx->protoop_inputv[2];
+    uint64_t nb_bytes_acknowledged = (uint64_t) cnx->protoop_inputv[3];
+    uint64_t lost_packet_number = (uint64_t) cnx->protoop_inputv[4];
+    uint64_t current_time = (uint64_t) cnx->protoop_inputv[5];
+
+    if (cnx->congestion_alg != NULL) {
+        cnx->congestion_alg->alg_notify(path_x, notification, rtt_measurement,
+            nb_bytes_acknowledged, lost_packet_number, current_time);
+    }
+    return 0;
+}
+
+
+void picoquic_congestion_algorithm_notify_func(picoquic_cnx_t *cnx, picoquic_path_t* path_x, picoquic_congestion_notification_t notification, uint64_t rtt_measurement,
+                                 uint64_t nb_bytes_acknowledged, uint64_t lost_packet_number, uint64_t current_time) {
+    protoop_prepare_and_run_noparam(cnx, &PROTOOP_NOPARAM_CONGESTION_ALGORITHM_NOTIFY, NULL, path_x, notification, rtt_measurement, nb_bytes_acknowledged,
+            lost_packet_number, current_time);
+}
+
+/**
+ * See PROTOOP_NOPARAM_CALLBACK_FUNCTION
+ */
+protoop_arg_t callback_function(picoquic_cnx_t *cnx)
+{
+    uint64_t stream_id = (uint64_t) cnx->protoop_inputv[0];
+    uint8_t* bytes = (uint8_t *) cnx->protoop_inputv[1];
+    size_t length = (size_t) cnx->protoop_inputv[2];
+    picoquic_call_back_event_t fin_or_event = (picoquic_call_back_event_t) cnx->protoop_inputv[3];
+
+    if (cnx->callback_fn) {
+        (cnx->callback_fn)(cnx, stream_id, bytes, length, fin_or_event, cnx->callback_ctx, NULL);
+    }
+
+    return 0;
+}
+
+void picoquic_set_alpn_select_fn(picoquic_quic_t* quic, picoquic_alpn_select_fn alpn_select_fn)
+{
+    if (quic->default_alpn != NULL) {
+        free((void *)quic->default_alpn);
+        quic->default_alpn = NULL;
+    }
+    quic->alpn_select_fn = alpn_select_fn;
+}
+
+void picoquic_enable_keep_alive(picoquic_cnx_t* cnx, uint64_t interval)
+{
+    if (interval == 0) {
+        /* Examine the transport parameters */
+        uint64_t idle_timeout = cnx->local_parameters.max_idle_timeout;
+
+        if (cnx->cnx_state >= picoquic_state_client_ready && idle_timeout > cnx->remote_parameters.max_idle_timeout) {
+            idle_timeout = cnx->remote_parameters.max_idle_timeout;
+        }
+        /* convert to microseconds */
+        idle_timeout *= 1000;
+        /* set interval to half that value */
+        cnx->keep_alive_interval = idle_timeout / 2;
+    } else {
+        cnx->keep_alive_interval = interval;
+    }
+}
+
+void picoquic_disable_keep_alive(picoquic_cnx_t* cnx)
+{
+    cnx->keep_alive_interval = 0;
+}
+
+int picoquic_set_verify_certificate_callback(picoquic_quic_t* quic, picoquic_verify_certificate_cb_fn cb, void* ctx,
+                                             picoquic_free_verify_certificate_ctx free_fn) {
+    picoquic_dispose_verify_certificate_callback(quic, quic->verify_certificate_callback_fn != NULL);
+
+    quic->verify_certificate_callback_fn = cb;
+    quic->free_verify_certificate_callback_fn = free_fn;
+    quic->verify_certificate_ctx = ctx;
+
+    return picoquic_enable_custom_verify_certificate_callback(quic);
+}
+
+int picoquic_is_client(picoquic_cnx_t* cnx)
+{
+    return cnx->client_mode;
+}
+
+uint64_t picoquic_get_local_error(picoquic_cnx_t* cnx)
+{
+    return cnx->local_error;
+}
+
+uint64_t picoquic_get_remote_error(picoquic_cnx_t* cnx)
+{
+    return cnx->remote_error;
+}
+
+void picoquic_set_client_authentication(picoquic_quic_t* quic, int client_authentication) {
+    picoquic_tls_set_client_authentication(quic, client_authentication);
+}
+
+void picoquic_received_packet(picoquic_cnx_t *cnx, SOCKET_TYPE socket, int recv_tos) {
+    protoop_prepare_and_run_noparam(cnx, &PROTOOP_NOPARAM_RECEIVED_PACKET, NULL, socket, recv_tos);
+}
+
+void picoquic_before_sending_packet(picoquic_cnx_t *cnx, SOCKET_TYPE socket) {
+    protoop_prepare_and_run_noparam(cnx, &PROTOOP_NOPARAM_BEFORE_SENDING_PACKET, NULL, socket);
+}
+
+void picoquic_received_segment(picoquic_cnx_t *cnx) {
+    protoop_prepare_and_run_noparam(cnx, &PROTOOP_NOPARAM_RECEIVED_SEGMENT, NULL, NULL);
+}
+
+void picoquic_segment_prepared(picoquic_cnx_t *cnx, picoquic_packet_t *pkt) {
+    protoop_prepare_and_run_noparam(cnx, &PROTOOP_NOPARAM_SEGMENT_PREPARED, NULL, pkt);
+}
+
+void picoquic_segment_aborted(picoquic_cnx_t *cnx) {
+    protoop_prepare_and_run_noparam(cnx, &PROTOOP_NOPARAM_SEGMENT_ABORTED, NULL, NULL);
+}
+
+void picoquic_header_parsed(picoquic_cnx_t *cnx, picoquic_packet_header *ph, picoquic_path_t* path, size_t length) {
+    protoop_prepare_and_run_noparam(cnx, &PROTOOP_NOPARAM_HEADER_PARSED, NULL, ph, path, length);
+}
+
+void picoquic_header_prepared(picoquic_cnx_t *cnx, picoquic_packet_header *ph, picoquic_path_t *path, picoquic_packet_t *packet, size_t length) {
+    protoop_prepare_and_run_noparam(cnx, &PROTOOP_NOPARAM_HEADER_PREPARED, NULL, ph, path, packet, length);
+}
+
+/*
+bool is_private(in_addr_t t) {
+    bool ret = false;
+    in_addr_t a = t & (in_addr_t) 0xff;
+    if( a == (in_addr_t) 0x7f ) ret = true;
+    if( a == (in_addr_t) 0x0a ) ret = true;
+    in_addr_t b = t & (in_addr_t) 0xe0ff;
+    if( b == (in_addr_t) 0xac ) ret = true;
+    in_addr_t c = t & (in_addr_t) 0xffff;
+    if( c == (in_addr_t) 0xa8c0 ) ret = true;
+    return ret;
+}
+*/
+
+int picoquic_getaddrs(struct sockaddr_storage *sas, uint32_t *if_indexes, int sas_length)
+{
+    int family;
+    struct ifaddrs *ifaddr, *ifa;
+    int count = 0;
+    struct sockaddr_storage *start_ptr = sas;
+    unsigned int if_index;
+
+    if (getifaddrs(&ifaddr) == -1) {
+        return 0;
+    }
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (strncmp("docker", ifa->ifa_name, 6) == 0 ||
+            strncmp("lo", ifa->ifa_name, 2) == 0 ||
+            strncmp("tun", ifa->ifa_name, 3) == 0 ||
+            strncmp("virbr", ifa->ifa_name, 5) == 0)
+        {
+            /* Do not consider those addresses */
+            continue;
+        }
+        /* What if an interface has no IP address? */
+        if (ifa->ifa_addr) {
+            family = ifa->ifa_addr->sa_family;
+            if (family == AF_INET || family == AF_INET6) {
+                struct sockaddr_storage *sai = (struct sockaddr_storage *) ifa->ifa_addr;
+                if (family == AF_INET6) {
+                    struct sockaddr_in6 *sai6 = (struct sockaddr_in6 *) ifa->ifa_addr;
+                    // Using sai6->sin6_addr.__in6_u.__u6_addr16[0] is not portable...
+                    if (sai6->sin6_addr.s6_addr[0] == 0xfe && sai6->sin6_addr.s6_addr[1] == 0x80) {
+                        continue;
+                    }
+                }
+                if (count < sas_length) {
+                    if_index = if_nametoindex(ifa->ifa_name);
+                    memcpy(&if_indexes[count], &if_index, sizeof(uint32_t));
+                    size_t sockaddr_size = family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+                    memcpy(&start_ptr[count++], sai, sockaddr_size);
+                }
+            }
+        }
+    }
+
+    freeifaddrs(ifaddr);
+
+    return count;
+}
+
+/**
+ * See PROTOOP_NOPARAM_PRINTF
+ */
+protoop_arg_t protoop_printf(picoquic_cnx_t *cnx)
+{
+    protoop_arg_t *fmt_args = (protoop_arg_t *) cnx->protoop_inputv[1];
+    switch (cnx->protoop_inputv[2]) {
+        case 0: printf("%s", (const char *) cnx->protoop_inputv[0]); break;
+        case 1: printf((const char *) cnx->protoop_inputv[0], fmt_args[0]); break;
+        case 2: printf((const char *) cnx->protoop_inputv[0], fmt_args[0], fmt_args[1]); break;
+        case 3: printf((const char *) cnx->protoop_inputv[0], fmt_args[0], fmt_args[1], fmt_args[2]); break;
+        case 4: printf((const char *) cnx->protoop_inputv[0], fmt_args[0], fmt_args[1], fmt_args[2], fmt_args[3]); break;
+        case 5: printf((const char *) cnx->protoop_inputv[0], fmt_args[0], fmt_args[1], fmt_args[2], fmt_args[3], fmt_args[4]); break;
+        case 6: printf((const char *) cnx->protoop_inputv[0], fmt_args[0], fmt_args[1], fmt_args[2], fmt_args[3], fmt_args[4], fmt_args[5]); break;
+        case 7: printf((const char *) cnx->protoop_inputv[0], fmt_args[0], fmt_args[1], fmt_args[2], fmt_args[3], fmt_args[4], fmt_args[5], fmt_args[6]); break;
+        case 8: printf((const char *) cnx->protoop_inputv[0], fmt_args[0], fmt_args[1], fmt_args[2], fmt_args[3], fmt_args[4], fmt_args[5], fmt_args[6], fmt_args[7]); break;
+        case 9: printf((const char *) cnx->protoop_inputv[0], fmt_args[0], fmt_args[1], fmt_args[2], fmt_args[3], fmt_args[4], fmt_args[5], fmt_args[6], fmt_args[7], fmt_args[8]); break;
+        case 10: printf((const char *) cnx->protoop_inputv[0], fmt_args[0], fmt_args[1], fmt_args[2], fmt_args[3], fmt_args[4], fmt_args[5], fmt_args[6], fmt_args[7], fmt_args[8], fmt_args[9]); break;
+        default:
+            printf("protoop printf cannot handle more than 10 arguments, %" PRIu64 " were given\n", (unsigned long) cnx->protoop_inputv[2]);
+    }
+    fflush(stdout);
+    return 0;
+}
+
+protoop_arg_t protoop_snprintf(picoquic_cnx_t *cnx)
+{
+    char *buf = (char *) cnx->protoop_inputv[0];
+    size_t buf_len = (size_t) cnx->protoop_inputv[1];
+    char *fmt = (char *) cnx->protoop_inputv[2];
+    protoop_arg_t *fmt_args = (protoop_arg_t *) cnx->protoop_inputv[3];
+    switch (cnx->protoop_inputv[4]) {
+        case 0: return snprintf(buf, buf_len, "%s", fmt);
+        case 1: return snprintf(buf, buf_len, fmt, fmt_args[0]);
+        case 2: return snprintf(buf, buf_len, fmt, fmt_args[0], fmt_args[1]);
+        case 3: return snprintf(buf, buf_len, fmt, fmt_args[0], fmt_args[1], fmt_args[2]);
+        case 4: return snprintf(buf, buf_len, fmt, fmt_args[0], fmt_args[1], fmt_args[2], fmt_args[3]);
+        case 5: return snprintf(buf, buf_len, fmt, fmt_args[0], fmt_args[1], fmt_args[2], fmt_args[3], fmt_args[4]);
+        case 6: return snprintf(buf, buf_len, fmt, fmt_args[0], fmt_args[1], fmt_args[2], fmt_args[3], fmt_args[4], fmt_args[5]);
+        case 7: return snprintf(buf, buf_len, fmt, fmt_args[0], fmt_args[1], fmt_args[2], fmt_args[3], fmt_args[4], fmt_args[5], fmt_args[6]);
+        case 8: return snprintf(buf, buf_len, fmt, fmt_args[0], fmt_args[1], fmt_args[2], fmt_args[3], fmt_args[4], fmt_args[5], fmt_args[6], fmt_args[7]);
+        case 9: return snprintf(buf, buf_len, fmt, fmt_args[0], fmt_args[1], fmt_args[2], fmt_args[3], fmt_args[4], fmt_args[5], fmt_args[6], fmt_args[7], fmt_args[8]);
+        case 10: return snprintf(buf, buf_len, fmt, fmt_args[0], fmt_args[1], fmt_args[2], fmt_args[3], fmt_args[4], fmt_args[5], fmt_args[6], fmt_args[7], fmt_args[8], fmt_args[9]);
+        default:
+            printf("protoop snprintf cannot handle more than 10 arguments, %" PRIu64 " were given\n", cnx->protoop_inputv[4]);
+    }
+    fflush(stdout);
+    return 0;
+}
+
+/* A simple no-op */
+protoop_arg_t protoop_noop(picoquic_cnx_t *cnx)
+{
+    /* Do nothing! */
+    return 0;
+}
+
+/* Always return true */
+protoop_arg_t protoop_true(picoquic_cnx_t *cnx)
+{
+    return true;
+}
+
+/* Always return false */
+protoop_arg_t protoop_false(picoquic_cnx_t *cnx)
+{
+    return false;
+}
+
+
+protocol_operation_param_struct_t *create_protocol_operation_param(param_id_t param, protocol_operation op)
+{
+    protocol_operation_param_struct_t *popst = malloc(sizeof(protocol_operation_param_struct_t));
+    if (!popst) {
+        printf("ERROR: failed to allocate memory for protocol operation param\n");
+        return NULL;
+    }
+    popst->param = param;
+    popst->core = op;
+    popst->intern = true;  /* Assumes it is internal */
+    popst->running = false; /* Of course, it does not run yet */
+    /* Ensure NULL values */
+    popst->replace = NULL;
+    popst->pre = NULL;
+    popst->post = NULL;
+    return popst;
+}
+
+int register_noparam_protoop(picoquic_cnx_t* cnx, protoop_id_t *pid, protocol_operation op)
+{
+    /* This is a safety check */
+    protocol_operation_struct_t *post;
+    /* First check if the hash has been computed or not */
+    if (pid->hash == 0) {
+        /* And compute it if needed */
+        pid->hash = hash_value_str(pid->id);
+    }
+    HASH_FIND_PID(cnx->ops, &(pid->hash), post);
+    if (post) {
+        printf("ERROR: trying to register twice the non-parametrable protocol operation %s\n", pid->id);
+        return 1;
+    }
+
+    post = malloc(sizeof(protocol_operation_struct_t));
+    if (!post) {
+        printf("ERROR: failed to allocate memory to register non-parametrable protocol operation %s\n", pid->id);
+        return 1;
+    }
+    size_t p_strlen = (strlen(pid->id) + 1);
+    post->pid.id = malloc(sizeof(char) * p_strlen);
+    if (!post->pid.id) {
+        free(post);
+        printf("ERROR: failed to allocate memory to register name of %s\n", pid->id);
+        return 1;
+    }
+    strncpy(post->pid.id, pid->id, p_strlen);
+    strncpy(post->name, pid->id, sizeof(post->name) > p_strlen ? p_strlen : sizeof(post->name));
+    post->is_parametrable = false;
+    post->params = create_protocol_operation_param(NO_PARAM, op);
+    if (!post->params) {
+        free(post->pid.id);
+        free(post);
+        return 1;
+    }
+    /* Don't forget to copy the hash of the pid */
+    post->pid.hash = pid->hash;
+    HASH_ADD_PID(cnx->ops, pid.hash, post);
+    return 0;
+}
+
+int register_param_protoop(picoquic_cnx_t* cnx, protoop_id_t *pid, param_id_t param, protocol_operation op)
+{
+    /* Two possible options: either the protocol operation had a previously registered
+     * value for another parameter, or it is the first one
+     */
+    protocol_operation_struct_t *post;
+    protocol_operation_param_struct_t *popst;
+    /* First check if the hash has been computed or not */
+    if (pid->hash == 0) {
+        /* And compute it if needed */
+        pid->hash = hash_value_str(pid->id);
+    }
+    HASH_FIND_PID(cnx->ops, &(pid->hash), post);
+    if (post) {
+        /* Two sanity checks:
+         * 1- Is it really a parametrable protocol operation?
+         * 2- Is there no previously registered protocol operation for that parameter?
+         */
+        if (!post->is_parametrable) {
+            printf("ERROR: trying to insert parameter in non-parametrable protocol operation %s\n", pid->id);
+            return 1;
+        }
+        HASH_FIND(hh, post->params, &param, sizeof(param_id_t), popst);
+        if (popst) {
+            printf("ERROR: trying to register twice the parametrable protocol operation %s with param %u\n", pid->id, param);
+            return 1;
+        }
+    } else {
+        /* Create it */
+        post = malloc(sizeof(protocol_operation_struct_t));
+        if (!post) {
+            printf("ERROR: failed to allocate memory to register parametrable protocol operation %s with param %u\n", pid->id, param);
+            return 1;
+        }
+        size_t p_strlen = (strlen(pid->id) + 1);
+        post->pid.id = malloc(sizeof(char) * p_strlen);
+        if (!post->pid.id) {
+            free(post);
+            printf("ERROR: failed to allocate memory to register name of %s with param %u\n", pid->id, param);
+            return 1;
+        }
+        strncpy(post->pid.id, pid->id, p_strlen);
+        strncpy(post->name, pid->id, sizeof(post->name) > p_strlen ? p_strlen : sizeof(post->name));
+        post->is_parametrable = true;
+        /* Ensure the value is NULL */
+        post->params = NULL;
+    }
+
+    popst = create_protocol_operation_param(param, op);
+
+    if (!popst) {
+        /* If the post is new, remove it */
+        if (!post->params) {
+            free(post->pid.id);
+            free(post);
+        }
+        return 1;
+    }
+
+    /* Insert the post if it is new */
+    if (!post->params) {
+        /* Don't forget to copy the hash of the pid */
+        post->pid.hash = pid->hash;
+        HASH_ADD_PID(cnx->ops, pid.hash, post);
+    }
+    /* Insert the param struct */
+    HASH_ADD(hh, post->params, param, sizeof(param_id_t), popst);
+    return 0;
+}
+
+int register_param_protoop_default(picoquic_cnx_t* cnx, protoop_id_t *pid, protocol_operation op)
+{
+    return register_param_protoop(cnx, pid, NO_PARAM, op);
+}
+
+size_t reserve_frames(picoquic_cnx_t* cnx, uint8_t nb_frames, reserve_frame_slot_t* slots)
+{
+    if (!cnx->current_plugin) {
+        printf("ERROR: reserve_frames can only be called by pluglets with plugins!\n");
+        return 0;
+    }
+    PUSH_LOG_CTX(cnx, "\"plugin\": \"%s\", \"protoop\": \"%s\", \"anchor\": \"%s\"",  cnx->current_plugin->name, cnx->current_protoop->name, pluglet_type_name(cnx->current_anchor));
+
+    /* Well, or we could use queues instead ? */
+    reserve_frames_block_t *block = malloc(sizeof(reserve_frames_block_t));
+    if (!block) {
+        return 0;
+    }
+    memset(block, 0, sizeof(reserve_frames_block_t));
+    block->nb_frames = nb_frames;
+    block->total_bytes = 0;
+    block->low_priority = true;
+    for (int i = 0; i < nb_frames; i++) {
+        block->total_bytes += slots[i].nb_bytes;
+        block->is_congestion_controlled |= slots[i].is_congestion_controlled;
+        block->low_priority &= slots[i].low_priority;   // it is higher priority as soon as a higher priority slot is present
+    }
+    block->frames = slots;
+    int err = 0;
+    if (block->is_congestion_controlled) {
+        err = queue_enqueue(cnx->current_plugin->block_queue_cc, block);
+    } else {
+        err = queue_enqueue(cnx->current_plugin->block_queue_non_cc, block);
+    }
+    if (err) {
+        free(block);
+        POP_LOG_CTX(cnx);
+        return 0;
+    }
+    LOG {
+        char ftypes_str[250];
+        size_t ftypes_ofs = 0;
+        for (int i = 0; i < nb_frames; i++) {
+            ftypes_ofs += snprintf(ftypes_str + ftypes_ofs, sizeof(ftypes_str) - ftypes_ofs, "%" PRIu64 "%s", block->frames[i].frame_type, i < nb_frames - 1 ? ", " : "");
+        }
+        ftypes_str[ftypes_ofs] = 0;
+        LOG_EVENT(cnx, "plugins", "reserve_frames", "", "{\"nb_frames\": %d, \"total_bytes\": %" PRIu64 ", \"is_cc\": %d, \"frames\": [%s]}", block->nb_frames, block->total_bytes, block->is_congestion_controlled, ftypes_str);
+    }
+    POP_LOG_CTX(cnx);
+    return block->total_bytes;
+}
+
+reserve_frame_slot_t* cancel_head_reservation(picoquic_cnx_t* cnx, uint8_t *nb_frames, int congestion_controlled) {
+    if (!cnx->current_plugin) {
+        printf("ERROR: cancel_head_reservation can only be called by pluglets with plugins!\n");
+        return 0;
+    }
+    PUSH_LOG_CTX(cnx, "\"plugin\": \"%s\", \"protoop\": \"%s\", \"anchor\": \"%s\"",  cnx->current_plugin->name, cnx->current_protoop->name, pluglet_type_name(cnx->current_anchor));
+
+    queue_t *block_queue = congestion_controlled ? cnx->current_plugin->block_queue_cc : cnx->current_plugin->block_queue_non_cc;
+    reserve_frames_block_t *block = queue_dequeue(block_queue);
+    if (block == NULL) {
+        *nb_frames = 0;
+        POP_LOG_CTX(cnx);
+        return NULL;
+    }
+    *nb_frames = block->nb_frames;
+    reserve_frame_slot_t *slots = block->frames;
+    LOG {
+        char ftypes_str[250];
+        size_t ftypes_ofs = 0;
+        for (int i = 0; i < *nb_frames; i++) {
+            ftypes_ofs += snprintf(ftypes_str + ftypes_ofs, sizeof(ftypes_str) - ftypes_ofs, "%" PRIu64 "%s", block->frames[i].frame_type, i < *nb_frames - 1 ? ", " : "");
+        }
+        ftypes_str[ftypes_ofs] = 0;
+
+        LOG_EVENT(cnx, "plugins", "cancel_head_reservation", "", "{\"nb_frames\": %d, \"total_bytes\": %" PRIu64 ", \"is_cc\": %d, \"frames\": [%s]}", block->nb_frames, block->total_bytes, block->is_congestion_controlled, ftypes_str);
+    }
+    free(block);
+    POP_LOG_CTX(cnx);
+    return slots;
+}
+/* Indicates whether there exist non-low priority frames booked. */
+bool picoquic_has_booked_plugin_frames(picoquic_cnx_t *cnx)
+{
+    queue_node_t *n = cnx->reserved_frames->head;
+    while(n) {
+        reserve_frame_slot_t *s = n->data;
+        if (!s->low_priority)
+            return true;
+        n = n->next;
+    }
+    n = cnx->retry_frames->head;
+    while(n) {
+        reserve_frame_slot_t *s = n->data;
+        if (!s->low_priority)
+            return true;
+        n = n->next;
+    }
+    return false;
+}
+
+void quicctx_register_noparam_protoops(picoquic_cnx_t *cnx)
+{
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_CONNECTION_STATE_CHANGED, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_CONGESTION_ALGORITHM_NOTIFY, &congestion_algorithm_notify);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_CALLBACK_FUNCTION, &callback_function);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_PRINTF, &protoop_printf);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_SNPRINTF, &protoop_snprintf);
+
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_PACKET_WAS_LOST, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_STREAM_OPENED, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_PLUGIN_STREAM_OPENED, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_STREAM_FLAGS_CHANGED, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_STREAM_CLOSED, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_FAST_RETRANSMIT, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_RETRANSMISSION_TIMEOUT, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_TAIL_LOSS_PROBE, &protoop_noop);
+
+    /** \todo Those should be replaced by a pre/post of incoming_encrypted or incoming_segment */
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_RECEIVED_PACKET, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_BEFORE_SENDING_PACKET, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_SEGMENT_PREPARED, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_SEGMENT_ABORTED, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_RECEIVED_SEGMENT, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_HEADER_PARSED, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_HEADER_PREPARED, &protoop_noop);
+    /** \todo document these */
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_LOG_EVENT, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_PUSH_LOG_CONTEXT, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_POP_LOG_CONTEXT, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_CONNECTION_ERROR, &connection_error);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_NOPARAM_UNKNOWN_TP_RECEIVED, &protoop_noop);
+    register_noparam_protoop(cnx, &PROTOOP_NOPARAM_PEER_ADDRESS_CHANGED, &protoop_noop);
+}

@@ -1,0 +1,15 @@
+be.mpiraux.monitoring
+connection_state_changed replace cnx_state_changed.o
+header_parsed replace packet_received.o
+header_prepared replace packet_sent.o
+update_rtt post rtt_updated.o
+decode_stream_frame pre check_ooo_stream_frame.o
+decode_stream_frame pre check_spurious_stream_frame.o
+packet_was_lost pre packet_lost.o
+fast_retransmit post fast_retransmit.o
+retransmission_timeout post retransmission_timeout.o
+tail_loss_probe post tail_loss_probe.o
+stream_opened post stream_opened.o
+stream_closed post stream_closed.o
+prepare_stream_frame post stream_frame_written.o
+unknown_tp_received post unknown_tp_received.o
