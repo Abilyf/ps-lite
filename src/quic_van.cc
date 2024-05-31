@@ -9,12 +9,14 @@
 #include <stdlib.h>
 #include <thread>
 #include <string>
+#include <cjson/cJSON.h>
 
 #include "ps/internal/van.h"
 #include "netinet/tcp.h"
 #include "ps/internal/threadsafe_queue.h"
 #include "ps/internal/threadsafe_priority_queues.h"
 #include "quic_van.h"
+#include "ccpara.h"
 
 #define PICOQUIC_DEMO_STREAM_ID_INITIAL (uint64_t)((int64_t)-1)
 
@@ -1147,7 +1149,7 @@ namespace ps {
             //LG << "There are " << meta_size << " bytes of Meta need to be sent" << std::endl;
             //LG << "And " << n << " bytes of msg data need too" << std::endl;
             DBG_PRINTF("|Msg-Info|CMD:%d|Receiver:%d|Sender:%d|Node_id:%s|Meta Size:%d|Data Size:%d|", msg.meta.control.cmd, msg.meta.recver, msg.meta.sender, node_id.c_str(), meta_size, n);
-
+            uint64_t send_before = picoquic_current_time();
             bytes_sent += QUICMsgSend(meta_buf, &meta_size, node_id);
             send_bytes += meta_size;
 
@@ -1159,6 +1161,22 @@ namespace ps {
                 bytes_sent += QUICMsgSend(data->data(), &data_size, node_id);
                 send_bytes += data_size;
             }
+
+            //record parameter to json
+            uint64_t send_after = picoquic_current_time();
+            double fct = (double)(send_after - send_before) / 1000000; //秒
+            double trp = (double)(send_bytes * 8) / (double)(send_after - send_before); //mbps
+            if (msg.data.size() != 0 && msg.meta.push && !msg.meta.pull) {
+                append_rtt_to_json(m_qsnd[node_id]->cnx->path[0]->cc_minrtt, fct, trp, "push_data.json");
+            }
+            if (msg.data.size() != 0 && msg.meta.pull && !msg.meta.push) {
+                append_rtt_to_json(m_qsnd[node_id]->cnx->path[0]->cc_minrtt, fct, trp, "pull_data.json");
+            }
+            if (msg.data.size() != 0 && msg.meta.pull && msg.meta.push) {
+                append_rtt_to_json(m_qsnd[node_id]->cnx->path[0]->cc_minrtt, fct, trp, "pushpull_data.json");
+            }
+            //memset(m_qsnd[node_id]->cnx->path[0]->cc_minrtt, 0, m_qsnd[node_id]->cnx->path[0]->cc_minrtt->len * sizeof(uint64_t));
+            m_qsnd[node_id]->cnx->path[0]->cc_minrtt->len = 0;
 
             //If the actual number of bytes sent is not equal to the number of bytes that need to be sent
             if (bytes_sent != send_bytes) {
@@ -1364,5 +1382,81 @@ namespace ps {
         else {
             LG << "There is no connection to node " << old_id;
         }
+    }
+
+    void QUICVan::append_rtt_to_json(const cc_info_minrtt_t* cc_minrtt, double finished_time, double throughput, const char* filename) {
+        if (cc_minrtt == nullptr) {
+            std::cerr << "Invalid rtt_info pointer." << std::endl;
+            return;
+        }
+
+        // 创建cJSON对象
+        cJSON* json = cJSON_CreateObject();
+        if (json == nullptr) {
+            std::cerr << "Failed to create cJSON object." << std::endl;
+            return;
+        }
+
+        // 创建并填充RTT数组
+        cJSON* rtt_array = cJSON_CreateArray();
+        if (rtt_array == nullptr) {
+            std::cerr << "Failed to create cJSON array." << std::endl;
+            cJSON_Delete(json);
+            return;
+        }
+
+        for (int i = 0; i < cc_minrtt->len; i++) {
+            cJSON* rtt_item = cJSON_CreateNumber(static_cast<double>(cc_minrtt->minrtt[i]));
+            if (rtt_item == nullptr) {
+                std::cerr << "Failed to create cJSON number." << std::endl;
+                cJSON_Delete(json);
+                cJSON_Delete(rtt_array);
+                return;
+            }
+            cJSON_AddItemToArray(rtt_array, rtt_item);
+        }
+
+        // 将RTT数组添加到JSON对象
+        cJSON_AddItemToObject(json, "RTT", rtt_array);
+
+        // 添加完成时间和吞吐量到JSON对象
+        cJSON* finished_time_json = cJSON_CreateNumber(finished_time);
+        if (finished_time_json == nullptr) {
+            std::cerr << "Failed to create cJSON number for finished_time." << std::endl;
+            cJSON_Delete(json);
+            return;
+        }
+        cJSON_AddItemToObject(json, "FinishedTime", finished_time_json);
+
+        cJSON* throughput_json = cJSON_CreateNumber(throughput);
+        if (throughput_json == nullptr) {
+            std::cerr << "Failed to create cJSON number for throughput." << std::endl;
+            cJSON_Delete(json);
+            return;
+        }
+        cJSON_AddItemToObject(json, "Throughput", throughput_json);
+
+        // 将JSON对象追加写入文件
+        FILE* file = fopen(filename, "a");
+        if (file == nullptr) {
+            std::cerr << "Failed to open file for appending." << std::endl;
+            cJSON_Delete(json);
+            return;
+        }
+
+        char* json_string = cJSON_Print(json);
+        if (json_string == nullptr) {
+            std::cerr << "Failed to print cJSON object." << std::endl;
+            fclose(file);
+            cJSON_Delete(json);
+            return;
+        }
+
+        fprintf(file, "%s\n", json_string);
+        fclose(file);
+
+        // 释放内存
+        cJSON_Delete(json);
+        free(json_string);
     }
 }

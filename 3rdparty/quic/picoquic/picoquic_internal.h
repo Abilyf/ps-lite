@@ -32,6 +32,7 @@
 #include "picosocks.h"
 #include "uthash.h"
 #include "plugin.h"
+#include "ccpara.h"
 
 #ifdef __APPLE__
 #include <machine/endian.h>
@@ -516,6 +517,9 @@ typedef struct st_picoquic_path_t {
     picoquic_packet_context_t pkt_ctx[picoquic_nb_packet_context];
 
     plugin_struct_metadata_t *metadata;
+
+    //for rtt graph
+    cc_info_minrtt_t* cc_minrtt;
 } picoquic_path_t;
 
 /* Typedef for plugins */

@@ -1265,6 +1265,9 @@ int picoquic_create_path(picoquic_cnx_t* cnx, uint64_t start_time, struct sockad
                 path_x->pkt_ctx[pc].ack_delay_local = 10000;
             }
 
+            /*for drawing minrtt*/
+            path_x->cc_minrtt = cc_init_minrtt();
+
             /* And start the congestion algorithm */
             if (cnx->congestion_alg != NULL) {
                 cnx->congestion_alg->alg_init(cnx, path_x);

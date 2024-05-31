@@ -40,6 +40,7 @@
 #include "h3zero.h"
 #include "democlient.h"
 #include "demoserver.h"
+#include "ccpara.h"
 
 
 #ifndef __USE_XOPEN2K
@@ -244,6 +245,9 @@ namespace ps {
         void UpdateNodeID(int old_id, int new_id) override;
 
         std::string ByteArrayToString(const uint8_t* byte_array, size_t length);
+
+        //void append_rtt_to_json(const cc_info_minrtt_t* cc_minrtt, double finished_time, double throughput, const char* filename);
+        void append_rtt_to_json(const cc_info_minrtt_t* cc_minrtt, double finished_time, double throughput, const char* filename);
 
     private:
         Van* m_zmq_van_;

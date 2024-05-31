@@ -7,7 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)
 
 add_library(pslite)
-target_link_libraries(pslite PUBLIC -lpthread)
+target_link_libraries(pslite PUBLIC -lpthread -lcjson)
 
 if(POLICY CMP0074)  # Support Protobuf_ROOT etc environment variables on CMake 3.12+
   cmake_policy(SET CMP0074 NEW)
@@ -77,7 +77,7 @@ file(GLOB_RECURSE SOURCE "src/*.cc")
 target_include_directories(pslite PUBLIC "${PROJECT_SOURCE_DIR}/include/")
 target_sources(pslite PRIVATE ${SOURCE})
 
-#add_subdirectory(tests)
+add_subdirectory(tests)
 
 #quic
 add_subdirectory("3rdparty/quic")

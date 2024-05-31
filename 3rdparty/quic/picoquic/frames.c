@@ -25,6 +25,7 @@
 #include <string.h>
 #include "plugin.h"
 #include "memory.h"
+#include "ccpara.h"
 
 /* ****************************************************
  * Frames private declarations
@@ -2142,6 +2143,7 @@ protoop_arg_t update_rtt(picoquic_cnx_t *cnx)
                         old_path->retransmit_timer = old_path->smoothed_rtt + 4 * old_path->rtt_variant + old_path->max_ack_delay;
                     }
                     old_path->rtt_sample = rtt_estimate;
+                    cc_add_minrtt(old_path->cc_minrtt, old_path->rtt_sample);
 
                     if (PICOQUIC_MIN_RETRANSMIT_TIMER > old_path->retransmit_timer) {
                         old_path->retransmit_timer = PICOQUIC_MIN_RETRANSMIT_TIMER;

@@ -84,7 +84,7 @@ SET(PICOQUIC_LIBRARY_FILES
         picoquic/michelfralloc/sbrk.h
         picoquic/michelfralloc/michelfralloc.c
         picoquic/michelfralloc/michelfralloc.h
-    picoquic/cc_common.c picoquic/cc_common.h picoquic/bbr.c)
+    picoquic/cc_common.c picoquic/cc_common.h picoquic/bbr.c picoquic/ibbr.c picoquic/ccpara.c)
 
 set(PICOHTTP_LIBRARY_FILES
     picohttp/democlient.c
