@@ -25,9 +25,9 @@ CFLAGS += -fsanitize=address
 LDFLAGS += -fsanitize=address
 endif
 
-ifeq ($(NS3),1)
+#ifeq ($(NS3),1)
 CFLAGS += -fPIC
-endif
+#endif
 
 all: libubpf.a test
 
