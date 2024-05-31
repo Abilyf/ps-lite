@@ -865,7 +865,7 @@ extern picoquic_congestion_algorithm_t* picoquic_cubic_algorithm;
 extern picoquic_congestion_algorithm_t* picoquic_bbr_algorithm;
 extern picoquic_congestion_algorithm_t* picoquic_ibbr_algorithm;
 
-#define PICOQUIC_DEFAULT_CONGESTION_ALGORITHM picoquic_ibbr_algorithm;//这一部分指定默认的cc算法
+#define PICOQUIC_DEFAULT_CONGESTION_ALGORITHM picoquic_bbr_algorithm;//这一部分指定默认的cc算法
 
 void picoquic_set_default_congestion_algorithm(picoquic_quic_t* quic, picoquic_congestion_algorithm_t const* algo);
 
